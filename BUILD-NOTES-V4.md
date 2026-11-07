@@ -288,3 +288,118 @@ nửa đầu không lời, lời sai be bét ("Okey don't idols").
   rất sáng/bận rộn, pixel gần-trắng của chính nền có thể làm cổng dễ qua
   — chấp nhận ở mức lưới bắt thảm hoạ "đốt mà không ra chữ"; kiểm bằng
   mắt khi nghiệm thu vẫn là chốt cuối.
+
+---
+
+# Đợt nâng cấp BATCH LƯU BỀN (sau v4.1.0 — Quan Hiểu Đồng; VERSION giữ nguyên 4.1.0, Tổng 98 chốt số bản khi phát hành)
+
+## Thiết kế
+
+### 1) batch.json — trạng thái batch ghi xuống đĩa
+- File `work/batch.json` (cùng cấp thư mục `work/batch/` chứa thư mục từng
+  bài): `{"version": 1, "saved_at", "items": [...]}`. Mỗi bài ghi: `id`,
+  `kind` (link/file), `url` hoặc `src` (file staged), `title`, `status`
+  (pending/running/done/error — trạng thái runtime "queued" ghi thành
+  "pending"), `progress`, `label`, `error`, `project_id`, `opts` đã dùng
+  (want_video/sep_mode/style/guide/bg), `cleaned` (danh sách file đã dọn),
+  `created_at`/`updated_at`/`finished_at`.
+- Ghi NGUYÊN TỬ: ghi `batch.json.tmp` rồi `os.replace`. `_save_batch()`
+  được gọi ở MỌI chuyển trạng thái: tạo bài (cả 2 endpoint), worker nhận
+  bài (running), có tiêu đề thật từ YouTube, xong (done — sau dọn đĩa),
+  lỗi (error). Lỗi ghi file chỉ in log, không làm hỏng tác vụ đang chạy.
+
+### 2) Khôi phục + Chạy tiếp
+- `main()` gọi `_load_batch()` trước khi mở server. Bài done → hiện lại
+  done, ctx nối lại `karaoke.mp4` trên đĩa + beat trỏ sang project (Xem/
+  Tải/Lưu/tải beat chạy như chưa từng tắt app). Bài error → giữ nguyên
+  kèm lỗi. Bài pending/running lúc tắt → "queued" chờ; riêng bài từng
+  "running" gắn cờ `interrupted` + nhãn "Bị gián đoạn (app đã tắt giữa
+  chừng)". Bài khôi phục KHÔNG tự chạy khi mở app.
+- Endpoint mới `POST /api/batch/resume`: chỉ xếp lại bài status "queued"
+  chưa xong — bài done không chạy lại, bài error giữ nguyên để chẩn
+  đoán. Chặn xếp trùng bằng tập `_BATCH_INFLIGHT` (bấm Chạy tiếp 2 lần:
+  lần 2 trả resumed=0).
+- Giao diện: mở app tự gọi `checkRestoredBatch()` — có đợt lưu bền thì
+  hiện lại danh sách + nút "▶ Chạy tiếp N bài dở" (chỉ hiện khi có bài
+  queued chưa live). Bài khôi phục hiện badge "⏸ Chờ chạy tiếp". Trường
+  API mới: `interrupted`, `live`, `sep_mode` trong `_batch_public`;
+  pollBatch chỉ coi bài queued-CÒN-LIVE là đang hoạt động (bài chờ chạy
+  tiếp không giữ poll chạy mãi).
+- Bài file chạy tiếp: file staged gốc đã bị xoá sau lần nạp đầu thì
+  chạy tiếp từ `song.wav` đã trích trong thư mục bài (so đường dẫn
+  tuyệt đối để không tự trích đè lên chính nó); mất cả hai → lỗi rõ
+  "File nguồn của bài này đã mất — hãy thêm lại file".
+
+### 3) Song song theo chế độ tách (thay queue.Queue bằng bộ xếp lịch)
+- Hằng số: `BATCH_AI_PARALLEL = 1`, `BATCH_PARALLEL = 2` (= số worker).
+  Worker lấy bài qua `_batch_take()`: quét hàng chờ, chỉ lấy bài mà chế
+  độ tách của nó còn "suất" (ai < 1, fast < 2). Batch toàn AI → 1
+  bài/lần; batch toàn fast → 2 bài/lần.
+- Batch LẪN hai chế độ: tính theo TỪNG BÀI — bài ai chiếm suất ai (tối
+  đa 1), bài fast chiếm suất fast (tối đa 2), tổng đồng thời không quá
+  số worker (2). Bài chưa có suất nằm chờ tại chỗ; bài phía sau thuộc
+  chế độ còn suất được lấy trước (không kẹt đầu hàng). Lỗi từng bài vẫn
+  độc lập như cũ; trần 20 link/đợt giữ nguyên.
+
+### 4) Dọn đĩa khi done
+- Chỉ chạy trong `_cleanup_batch_item()` sau khi bài đạt done THẬT
+  (run_pipeline đã qua cổng `verify_export_text` mới tới được đây) và
+  SAU khi project đã được tạo (project giữ bản sao riêng). Bài lỗi
+  không bao giờ dọn.
+- Danh sách file bị xoá trong thư mục bài: `song.wav`, `inst.wav`,
+  `vocal.wav`, `mixed.wav` (WAV toàn bài), `yt_src.*` (nguồn yt-dlp
+  tải về), `*.pcm16k` (WAV 16kHz trung gian của khâu nghe/căn lời —
+  gồm cả `vocal.wav.pcm16k` ở đường tự chép), `grad_*.png` /
+  `gradanim_*.mp4` (nền gradient app tự sinh trong thư mục bài, sinh
+  lại được từ opts).
+- GIỮ: `karaoke.mp4` (video ra), `lyrics.ass` + mọi `*.lrc` kèm theo,
+  và toàn bộ thư mục project. Sau dọn, ctx của bài trỏ `inst_wav` sang
+  bản beat trong project để nút "tải beat" của bài vẫn chạy; danh sách
+  file đã dọn ghi vào trường `cleaned` trong batch.json.
+
+### 5) batch.json hỏng
+- Parse lỗi / sai cấu trúc → in 1 dòng cảnh báo (stderr), đổi tên file
+  thành `batch.json.corrupt` (giữ nguyên để xem lại), coi như batch
+  trống, app mở bình thường. Từng mục trong file mà sai lệch quá (thiếu
+  id, link trống) thì bỏ qua mục đó, không kéo sập cả đợt.
+
+## Lỗi bắt được nhờ lưới khi làm đợt này
+- **Đua trạng thái ở POST /api/batch (có từ trước, đợt này làm lộ rõ):**
+  endpoint cũ kiểm tra "còn bài queued nào không" bằng cách đọc lại
+  status SAU vòng tạo — worker nhanh tay chuyển bài sang "running"
+  trước khi kiểm tra thì đợt toàn link tốt bị trả 400 oan. Đợt này thêm
+  `_save_batch()` (ghi đĩa) vào giữa càng nới rộng cửa sổ đua → test bắt
+  được ngay. Đã sửa: ghi nhận `had_valid` ngay tại thời điểm tạo bài.
+
+## Kiểm — số đo thật (chạy trên VM, stub yt-dlp + Whisper như lưới cũ)
+- **test_batch MỞ RỘNG: 41/41 PASS** — gồm các ca mới:
+  cổng song song (unit, monkeypatch `_run_batch_item` ghi độ song song
+  thật: ai tối đa 1, tổng tối đa 2, 6/6 bài done) · ghi/đọc batch.json
+  đủ trường + opts · tắt app giữa batch (stub tải chậm 10s, kill server
+  khi có done + có dở) → mở lại: done giữ done, bài dở thành chờ +
+  `interrupted`, video bài done xem lại được · Chạy tiếp: xếp đúng số
+  bài dở, bấm lần 2 resumed=0, bài done cũ KHÔNG chạy lại (mtime
+  karaoke.mp4 nguyên vẹn), bài lỗi bị resume bỏ qua + file chẩn đoán
+  (sentinel) còn nguyên · dọn đĩa cả ở phase thường và phase chạy tiếp
+  (chỉ còn karaoke.mp4 + lyrics.ass) · batch.json rác → app vẫn chạy,
+  batch trống, có batch.json.corrupt.
+- **Toàn bộ lưới cũ, KHÔNG hồi quy:** test_projects 16/16 ·
+  test_errors 34/34 · test_whisper FAILED none · test_ass2 FAILED
+  none · test_align FAILED none · test_auto FAILED none · test_link
+  FAILED none · smoke_server SMOKE PASS.
+- Hai việc bảo trì test kèm theo (không thuộc code app): kỳ vọng version
+  trong test_projects P10 cập nhật 4.0.0 → 4.1.0 cho khớp bản đã phát
+  hành (VERSION trong app.py KHÔNG đổi); fixture `/tmp/ktest/song.wav`
+  bị mất theo /tmp như các lần trước — đã tạo lại dạng sóng tổng hợp
+  45s đúng chuẩn test_errors đòi (duration 45±1s).
+
+## Điểm chưa chắc chắn
+- Lượt đo "tắt app" trong test là kill tiến trình server (SIGTERM) —
+  tương đương app bị đóng đột ngột ở mức tiến trình; ca mất điện/rút
+  phích giữa lúc ghi batch.json chưa mô phỏng được, nhưng ghi nguyên tử
+  tmp+rename là cơ chế chuẩn cho ca đó (file hoặc cũ hoặc mới, không
+  rách nửa chừng).
+- Trần song song khi batch lẫn chế độ mới kiểm ở mức unit (đếm độ song
+  song qua `_run_batch_item` giả lập) — pipeline thật (MDX + Whisper +
+  render) chạy lẫn ai/fast đồng thời chưa đo trên máy thật; giới hạn
+  tổng = số worker (2) giữ tải không vượt quá mức v4 vẫn chạy.

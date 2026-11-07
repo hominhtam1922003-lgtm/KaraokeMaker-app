@@ -19,7 +19,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "4.1.0"
+VERSION = "4.2.0"
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
@@ -561,12 +561,22 @@ def start_job(kind, fn):
 
 
 # ---------------- HÀNG LOẠT (batch): nhiều link, chạy song song ----------------
-BATCH = {}            # id -> item công khai + "_ctx" nội bộ
+# LƯU BỀN: toàn bộ đợt hàng loạt ghi xuống work/batch.json ở mọi chuyển
+# trạng thái (_save_batch) và được khôi phục khi mở app (_load_batch) —
+# tắt app giữa chừng không mất dấu, mở lại bấm "Chạy tiếp" làm nốt các
+# bài dở. Bài khôi phục KHÔNG tự chạy khi mở app.
+BATCH = {}            # id -> item công khai + "_ctx"/"_opts" nội bộ
 BATCH_ORDER = []      # thứ tự hiển thị
-BATCH_QUEUE = queue.Queue()
+BATCH_FILE = os.path.join(ROOT, "batch.json")
+_BATCH_SAVE_LOCK = threading.Lock()
+_BATCH_PENDING = []   # id đang chờ lượt (theo thứ tự nộp)
+_BATCH_INFLIGHT = set()  # id đã xếp hàng/đang chạy (chặn xếp trùng)
+_BATCH_COND = threading.Condition()
+_BATCH_RUNNING = {"ai": 0, "fast": 0}  # số bài đang chạy theo chế độ tách
 _BATCH_WORKERS = False
 BATCH_MAX_LINKS = 20
-BATCH_PARALLEL = 2    # số bài chạy cùng lúc (AI ăn CPU — 2 là vừa máy thường)
+BATCH_PARALLEL = 2    # trần bài FAST chạy cùng lúc (= số worker)
+BATCH_AI_PARALLEL = 1  # tách AI (MDX) ăn CPU nặng — 1 bài/lần cho khỏi giật máy
 
 
 SAVE_DIR = os.path.join(os.path.expanduser("~"), "Videos", "KaraokeMaker")
@@ -593,7 +603,130 @@ def _batch_public(item):
                                 "label", "error")}
     out["kind"] = item.get("kind", "link")
     out["project_id"] = item.get("project_id")
+    # interrupted: bài bị tắt app giữa chừng, đang chờ bấm Chạy tiếp.
+    # live: bài đang thật sự nằm trong hàng chờ/chạy của phiên này —
+    # bài khôi phục từ batch.json có live=False cho tới khi chạy tiếp.
+    out["interrupted"] = bool(item.get("interrupted"))
+    out["sep_mode"] = (item.get("_opts") or {}).get("sep_mode", "ai")
+    with _BATCH_COND:
+        out["live"] = item["id"] in _BATCH_INFLIGHT
     return out
+
+
+def _batch_persist(item):
+    """Bản ghi JSON của 1 bài hàng loạt — chỉ dữ liệu thuần; "_ctx" không
+    lưu (mở lại app dựng lại ctx từ thư mục bài trên đĩa)."""
+    st = item.get("status")
+    return {
+        "id": item["id"], "kind": item.get("kind", "link"),
+        "url": item.get("url"), "title": item.get("title"),
+        "status": "pending" if st == "queued" else st,
+        "progress": item.get("progress", 0.0),
+        "label": item.get("label", ""), "error": item.get("error"),
+        "project_id": item.get("project_id"),
+        "opts": item.get("_opts") or {}, "src": item.get("_src"),
+        "cleaned": item.get("cleaned") or [],
+        "created_at": item.get("created_at"),
+        "updated_at": item.get("updated_at"),
+        "finished_at": item.get("finished_at"),
+    }
+
+
+def _save_batch():
+    """Ghi batch.json NGUYÊN TỬ (ghi file .tmp rồi rename) — gọi ở mọi
+    chuyển trạng thái của batch. Lỗi ghi chỉ in log, không bao giờ được
+    làm hỏng tác vụ đang chạy."""
+    try:
+        with LOCK:
+            items = [_batch_persist(BATCH[i]) for i in BATCH_ORDER
+                     if i in BATCH]
+        data = {"version": 1, "saved_at": time.time(), "items": items}
+        tmp = BATCH_FILE + ".tmp"
+        with _BATCH_SAVE_LOCK:
+            with open(tmp, "w", encoding="utf-8") as f:
+                json.dump(data, f, ensure_ascii=False)
+            os.replace(tmp, BATCH_FILE)
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+
+
+# File trung gian trong thư mục 1 bài hàng loạt: WAV toàn bài
+# (song/inst/vocal/mixed), file nguồn yt-dlp (yt_src.*), WAV 16kHz
+# trung gian của khâu nghe lời (*.pcm16k), nền gradient app tự sinh
+# (grad_*.png / gradanim_*.mp4). Bài done thì xoá hết các loại này;
+# GIỮ karaoke.mp4 (video ra) + lyrics.ass / *.lrc kèm theo và toàn bộ
+# thư mục project.
+_BATCH_WAVS = ("song.wav", "inst.wav", "vocal.wav", "mixed.wav")
+
+
+def _cleanup_batch_item(item):
+    """Dọn đĩa cho bài vừa DONE THẬT (đã qua cổng kiểm xuất
+    verify_export_text trong run_pipeline mới tới được đây). Bài lỗi
+    KHÔNG dọn — giữ nguyên mọi file để chẩn đoán. Beat của bài vẫn còn
+    bản trong project (đã chép khi tạo project) nên sau khi dọn, ctx
+    trỏ sang beat trong project để nút tải beat của bài vẫn chạy."""
+    if item.get("status") != "done":
+        return
+    work = item["_ctx"]["_work"]
+    removed = []
+    targets = [os.path.join(work, n) for n in _BATCH_WAVS]
+    # yt_src.*: file nguồn yt-dlp tải về · *.pcm16k: WAV 16kHz trung
+    # gian của khâu nghe/căn lời · grad_*.png / gradanim_*.mp4: nền
+    # gradient do app tự sinh trong thư mục bài (sinh lại được từ opts).
+    for pat in ("yt_src.*", "*.pcm16k", "grad_*.png", "gradanim_*.mp4"):
+        targets += glob.glob(os.path.join(work, pat))
+    for p in targets:
+        if os.path.exists(p):
+            try:
+                os.remove(p)
+                removed.append(os.path.basename(p))
+            except OSError:
+                pass
+    item["cleaned"] = removed
+    pid = item.get("project_id")
+    if pid:
+        proj_inst = os.path.join(_project_dir(pid), "inst.wav")
+        if os.path.exists(proj_inst):
+            item["_ctx"]["inst_wav"] = proj_inst
+
+
+def _enqueue_batch(iid):
+    """Đưa 1 bài vào hàng chờ chạy. Trả False nếu bài đã ở trong hàng
+    hoặc đang chạy (chặn xếp trùng khi bấm Chạy tiếp nhiều lần)."""
+    with _BATCH_COND:
+        if iid in _BATCH_INFLIGHT:
+            return False
+        _BATCH_INFLIGHT.add(iid)
+        _BATCH_PENDING.append(iid)
+        _BATCH_COND.notify_all()
+        return True
+
+
+def _batch_take():
+    """Chờ lấy 1 bài mà chế độ tách của nó còn "suất" chạy trống:
+    mode ai -> tối đa BATCH_AI_PARALLEL bài cùng lúc; mode fast -> tối
+    đa BATCH_PARALLEL. Bài chưa có suất thì nằm chờ; bài phía sau thuộc
+    chế độ khác còn suất được lấy trước — không kẹt đầu hàng."""
+    with _BATCH_COND:
+        while True:
+            progressed = False
+            for idx, iid in enumerate(list(_BATCH_PENDING)):
+                item = BATCH.get(iid)
+                if item is None:
+                    _BATCH_PENDING.pop(idx)
+                    _BATCH_INFLIGHT.discard(iid)
+                    progressed = True
+                    break
+                mode = (item.get("_opts") or {}).get("sep_mode", "ai")
+                limit = BATCH_AI_PARALLEL if mode == "ai" \
+                    else BATCH_PARALLEL
+                if _BATCH_RUNNING.get(mode, 0) < limit:
+                    _BATCH_PENDING.pop(idx)
+                    _BATCH_RUNNING[mode] = \
+                        _BATCH_RUNNING.get(mode, 0) + 1
+                    return iid, mode
+            if not progressed:
+                _BATCH_COND.wait(0.5)
 
 
 def _run_batch_item(item, opts):
@@ -607,17 +740,31 @@ def _run_batch_item(item, opts):
             if label:
                 item["label"] = label
     if item.get("kind") == "file":
-        src = item["_src"]
+        src = item.get("_src")
+        wav = os.path.join(ctx["_work"], "song.wav")
+        if (not src or not os.path.exists(src)) and os.path.exists(wav):
+            # Lượt chạy trước (trước khi app tắt) đã trích xong WAV làm
+            # việc rồi file staged mới bị xoá — chạy tiếp từ WAV đó.
+            src = wav
+        if not src or not os.path.exists(src):
+            raise ValueError(
+                "File nguồn của bài này đã mất — hãy thêm lại file vào "
+                "hàng loạt")
         yt_title = item["title"] or "Karaoke"
-        video_path = None
         cb(10, "Đang đọc file...")
-        dur = _load_song_file(ctx, src, yt_title)
+        if os.path.abspath(src) == os.path.abspath(wav):
+            ctx.update(song_name=yt_title, song_wav=wav,
+                       duration=media.probe_duration(wav),
+                       inst_wav=None, inst_mode=None, out_mp4=None)
+            dur = ctx["duration"]
+        else:
+            dur = _load_song_file(ctx, src, yt_title)
+            try:
+                os.remove(src)
+            except OSError:
+                pass
         if dur <= 0:
             raise ValueError("File không đọc được tiếng — thử file khác")
-        try:
-            os.remove(src)
-        except OSError:
-            pass
         bg = resolve_bg(opts["bg"], ctx,
                         style_render_opts(opts.get("style"))[1])
         _require_bg_resolved(opts["bg"], bg)
@@ -633,6 +780,7 @@ def _run_batch_item(item, opts):
         opts["want_video"], ffmpeg_dir)
     with LOCK:
         item["title"] = yt_title
+    _save_batch()  # có tiêu đề thật rồi — lưu ngay, tắt app cũng còn
     dur = _load_song_file(ctx, src, yt_title)
     if dur <= 0:
         raise ValueError("File tải về không đọc được tiếng — thử link khác")
@@ -650,12 +798,20 @@ def _run_batch_item(item, opts):
 
 def _batch_worker():
     while True:
-        item_id, opts = BATCH_QUEUE.get()
+        item_id, mode = _batch_take()
         item = BATCH.get(item_id)
         if item is None:
+            with _BATCH_COND:
+                _BATCH_RUNNING[mode] = max(
+                    0, _BATCH_RUNNING.get(mode, 1) - 1)
+                _BATCH_INFLIGHT.discard(item_id)
+                _BATCH_COND.notify_all()
             continue
+        opts = item.get("_opts") or {}
         with LOCK:
-            item["status"] = "running"
+            item.update(status="running", interrupted=False,
+                        updated_at=time.time())
+        _save_batch()
         try:
             res = _run_batch_item(item, opts)
             # v4: bài hàng loạt xong -> thành PROJECT bền trong Thư viện
@@ -676,11 +832,26 @@ def _batch_worker():
             except Exception:  # noqa: BLE001
                 traceback.print_exc()
             with LOCK:
-                item.update(status="done", progress=100.0, label="Xong")
+                item.update(status="done", progress=100.0, label="Xong",
+                            updated_at=time.time(),
+                            finished_at=time.time())
+            # Done thật (đã qua cổng kiểm xuất) -> dọn file trung gian
+            # nặng trong thư mục bài, rồi lưu trạng thái cuối.
+            _cleanup_batch_item(item)
+            _save_batch()
         except Exception as e:  # noqa: BLE001
             traceback.print_exc()
             with LOCK:
-                item.update(status="error", error=str(e))
+                item.update(status="error", error=str(e),
+                            updated_at=time.time(),
+                            finished_at=time.time())
+            _save_batch()
+        finally:
+            with _BATCH_COND:
+                _BATCH_RUNNING[mode] = max(
+                    0, _BATCH_RUNNING.get(mode, 1) - 1)
+                _BATCH_INFLIGHT.discard(item_id)
+                _BATCH_COND.notify_all()
 
 
 def _ensure_batch_workers():
@@ -691,6 +862,98 @@ def _ensure_batch_workers():
         _BATCH_WORKERS = True
     for _ in range(BATCH_PARALLEL):
         threading.Thread(target=_batch_worker, daemon=True).start()
+
+
+def _batch_restore_item(raw):
+    """Dựng lại 1 item runtime từ 1 bản ghi trong batch.json. Mục sai
+    lệch quá (thiếu id / link trống) thì bỏ qua (trả None) — 1 mục hỏng
+    không kéo theo cả đợt. Bài "running" lúc app tắt -> "queued" +
+    interrupted (bị gián đoạn, chờ Chạy tiếp); bài "pending" -> "queued"
+    thường; bài done nối lại ctx tới file trên đĩa để Xem/Tải/Lưu và
+    tải beat (qua project) vẫn chạy."""
+    if not isinstance(raw, dict):
+        return None
+    iid = str(raw.get("id") or "")
+    if not iid or len(iid) > 40 or any(c not in _PID_OK for c in iid):
+        return None
+    kind = raw.get("kind") if raw.get("kind") in ("link", "file") \
+        else "link"
+    if kind == "link" and not raw.get("url"):
+        return None
+    ropts = raw.get("opts") if isinstance(raw.get("opts"), dict) else {}
+    opts = {"want_video": bool(ropts.get("want_video")),
+            "sep_mode": "fast" if ropts.get("sep_mode") == "fast"
+                        else "ai",
+            "style": ropts.get("style") or {},
+            "guide": ropts.get("guide") or 0,
+            "bg": ropts.get("bg")
+                  or {"type": "gradient", "value": "demtim"}}
+    ctx = new_ctx(os.path.join(ROOT, "batch", iid))
+    item = {"id": iid, "url": raw.get("url"), "title": raw.get("title"),
+            "kind": kind, "status": "queued", "progress": 0.0,
+            "label": "", "error": None,
+            "project_id": raw.get("project_id"),
+            "created_at": raw.get("created_at"),
+            "updated_at": raw.get("updated_at"),
+            "finished_at": raw.get("finished_at"),
+            "cleaned": raw.get("cleaned") or [],
+            "interrupted": False, "_opts": opts, "_ctx": ctx}
+    if kind == "file":
+        item["_src"] = raw.get("src")
+    st = raw.get("status")
+    if st == "done":
+        item.update(status="done", progress=100.0, label="Xong")
+        out = os.path.join(ctx["_work"], "karaoke.mp4")
+        if os.path.exists(out):
+            ctx["out_mp4"] = out
+        pid = item.get("project_id")
+        if pid:
+            proj_inst = os.path.join(_project_dir(pid), "inst.wav")
+            if os.path.exists(proj_inst):
+                ctx["inst_wav"] = proj_inst
+    elif st == "error":
+        item.update(status="error",
+                    error=raw.get("error") or "Lỗi không rõ")
+    elif st == "running":
+        item["interrupted"] = True
+        item["label"] = "Bị gián đoạn (app đã tắt giữa chừng)"
+    return item
+
+
+def _load_batch():
+    """Mở app: khôi phục đợt hàng loạt từ batch.json (nếu có). File
+    hỏng (JSON rác / sai cấu trúc) -> đổi tên thành batch.json.corrupt
+    và coi như batch trống — TUYỆT ĐỐI không làm sập app. Bài khôi
+    phục chỉ HIỆN LẠI, không tự chạy; người dùng bấm "Chạy tiếp"
+    (POST /api/batch/resume) mới xếp hàng lại."""
+    if not os.path.exists(BATCH_FILE):
+        return
+    try:
+        with open(BATCH_FILE, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        raw_items = data["items"]
+        if not isinstance(raw_items, list):
+            raise ValueError("batch.json: 'items' không phải danh sách")
+    except Exception:  # noqa: BLE001
+        print("batch.json hỏng — giữ sang batch.json.corrupt, "
+              "coi như batch trống", file=sys.stderr)
+        try:
+            os.replace(BATCH_FILE, BATCH_FILE + ".corrupt")
+        except OSError:
+            pass
+        return
+    for raw in raw_items:
+        try:
+            item = _batch_restore_item(raw)
+        except Exception:  # noqa: BLE001
+            traceback.print_exc()
+            continue
+        if item is None:
+            continue
+        with LOCK:
+            if item["id"] not in BATCH:
+                BATCH[item["id"]] = item
+                BATCH_ORDER.append(item["id"])
 
 
 # ---------------- v4: TẦNG DỰ ÁN (project) ----------------
@@ -1726,12 +1989,18 @@ class Handler(BaseHTTPRequestHandler):
                         "guide": guide, "bg": bg_req}
                 _ensure_batch_workers()
                 created, first_err = [], None
+                had_valid = False
+                now = time.time()
                 for raw_url in urls:
                     iid = uuid.uuid4().hex[:10]
                     item = {"id": iid, "url": raw_url, "title": None,
                             "kind": "link",
                             "status": "queued", "progress": 0.0, "label": "",
-                            "error": None,
+                            "error": None, "project_id": None,
+                            "interrupted": False, "cleaned": [],
+                            "created_at": now, "updated_at": now,
+                            "finished_at": None,
+                            "_opts": opts,
                             "_ctx": new_ctx(os.path.join(ROOT, "batch", iid))}
                     try:
                         item["url"] = ytdl.canonical_url(raw_url)
@@ -1743,8 +2012,13 @@ class Handler(BaseHTTPRequestHandler):
                         BATCH_ORDER.append(iid)
                     created.append(iid)
                     if item["status"] == "queued":
-                        BATCH_QUEUE.put((iid, opts))
-                if not any(BATCH[i]["status"] == "queued" for i in created):
+                        # Ghi nhận NGAY lúc tạo — worker có thể đã
+                        # chuyển bài sang "running" trước khi vòng lặp
+                        # xong, đọc lại status ở cuối sẽ trượt.
+                        had_valid = True
+                        _enqueue_batch(iid)
+                _save_batch()
+                if not had_valid:
                     return self._json(
                         {"error": first_err or "Không có link nào hợp lệ"},
                         400)
@@ -1787,17 +2061,39 @@ class Handler(BaseHTTPRequestHandler):
                 staged = os.path.join(stage_dir, iid + ext)
                 with open(staged, "wb") as f:
                     f.write(payload)
+                now = time.time()
                 item = {"id": iid, "url": None,
                         "title": os.path.splitext(name)[0] or "Karaoke",
                         "kind": "file",
                         "status": "queued", "progress": 0.0, "label": "",
-                        "error": None, "_src": staged,
+                        "error": None, "project_id": None,
+                        "interrupted": False, "cleaned": [],
+                        "created_at": now, "updated_at": now,
+                        "finished_at": None,
+                        "_opts": opts, "_src": staged,
                         "_ctx": new_ctx(os.path.join(ROOT, "batch", iid))}
                 with LOCK:
                     BATCH[iid] = item
                     BATCH_ORDER.append(iid)
-                BATCH_QUEUE.put((iid, opts))
+                _enqueue_batch(iid)
+                _save_batch()
                 self._json({"item": iid})
+
+            elif path == "/api/batch/resume":
+                # CHẠY TIẾP: xếp hàng lại các bài CHƯA xong (status
+                # queued — gồm bài khôi phục từ batch.json sau khi mở
+                # lại app). Bài done KHÔNG chạy lại; bài error giữ
+                # nguyên để chẩn đoán, không tự xếp lại.
+                _ensure_batch_workers()
+                resumed = 0
+                with LOCK:
+                    ids = [i for i in BATCH_ORDER if i in BATCH]
+                for iid in ids:
+                    item = BATCH.get(iid)
+                    if item and item.get("status") == "queued" \
+                            and _enqueue_batch(iid):
+                        resumed += 1
+                self._json({"ok": True, "resumed": resumed})
 
             elif path == "/api/save-video":
                 # Lưu video phiên chính vào Videos\KaraokeMaker (đường chính
@@ -2136,6 +2432,7 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def main():
+    _load_batch()  # khôi phục đợt hàng loạt dở dang (nếu có) để hiện lại
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"

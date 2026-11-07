@@ -510,12 +510,12 @@ def _():
         pass
 
 
-@scenario("P10 cuối lưới: server vẫn khoẻ, trang chủ 200, app-info version 4.0.0")
+@scenario("P10 cuối lưới: server vẫn khoẻ, trang chủ 200, app-info version 4.1.0")
 def _():
     st, raw, _h = http("GET", "/")
     assert st == 200 and b"Karaoke" in raw, st
     st, j = http_json("GET", "/api/app-info")
-    assert st == 200 and j["version"] == "4.0.0", (st, j)
+    assert st == 200 and j["version"] == "4.1.0", (st, j)
     st, j = http_json("GET", "/api/export/info")
     assert st == 200 and "yt4k" in j["formats"], (st, j)
 

@@ -635,8 +635,13 @@ function renderBatch(items) {
     } else if (it.status === "running") {
       badge = `<span class="badge run">Đang chạy ${Math.round(it.progress)}%</span>`;
       extra = `<span class="run-label">${escHtml(it.label || "")}</span>`;
-    } else {
+    } else if (it.live) {
       badge = '<span class="badge wait">Chờ lượt</span>';
+    } else {
+      badge = '<span class="badge wait">⏸ Chờ chạy tiếp</span>';
+      extra = it.interrupted
+        ? '<span class="err-text">App đã tắt giữa chừng — bấm “Chạy tiếp các bài dở” phía trên để làm nốt.</span>'
+        : '<span class="run-label">Bài đang chờ — bấm “Chạy tiếp các bài dở” phía trên.</span>';
     }
     div.innerHTML = `<div class="batch-head"><span class="batch-name">${kindTag}${name}</span>${badge}</div>
       <div class="progress batch-bar"><div class="bar" style="width:${it.progress || 0}%"></div></div>
@@ -645,6 +650,41 @@ function renderBatch(items) {
   }
   box.querySelectorAll(".bsave").forEach((b) =>
     b.addEventListener("click", () => saveBatchItem(b)));
+  updateResumeBtn(items);
+}
+function updateResumeBtn(items) {
+  const btn = $("btnBatchResume");
+  if (!btn) return;
+  const n = (items || []).filter(
+    (i) => i.status === "queued" && !i.live).length;
+  btn.hidden = n === 0;
+  btn.textContent = `▶ Chạy tiếp ${n} bài dở`;
+}
+$("btnBatchResume").addEventListener("click", async () => {
+  try {
+    const r = await postJSON("/api/batch/resume", {});
+    if (r.resumed > 0) {
+      toast(`Đang chạy tiếp ${r.resumed} bài…`);
+      startBatchPoll();
+    } else {
+      toast("Không có bài dở nào cần chạy tiếp.");
+    }
+  } catch (err) { toast(err.message, true); }
+});
+async function checkRestoredBatch() {
+  /* Mở app: nếu có đợt hàng loạt lưu bền từ lần trước thì hiện lại
+     danh sách; bài đang chạy thật (phiên này) thì poll tiếp, bài dở
+     thì để nút Chạy tiếp lo. */
+  try {
+    const data = await (await fetch("/api/batch")).json();
+    const items = data.items || [];
+    if (!items.length) return;
+    $("batchBox").hidden = false;
+    renderBatch(items);
+    if (items.some((i) => i.status === "running" || i.live)) {
+      startBatchPoll();
+    }
+  } catch (e) { /* server chưa sẵn sàng — bỏ qua */ }
 }
 async function saveBatchItem(btn) {
   btn.disabled = true;
@@ -659,7 +699,8 @@ async function pollBatch() {
     const data = await (await fetch("/api/batch")).json();
     renderBatch(data.items || []);
     const active = (data.items || []).some(
-      (i) => i.status === "queued" || i.status === "running");
+      (i) => i.status === "running"
+        || (i.status === "queued" && i.live));
     if (!active && batchTimer) {
       clearInterval(batchTimer);
       batchTimer = null;
@@ -1639,4 +1680,5 @@ restoreStyle();
 syncSepRadios();
 loadLibrary();
 loadPresets();
+checkRestoredBatch();
 showView("library");
