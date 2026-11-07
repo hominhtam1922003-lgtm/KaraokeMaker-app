@@ -66,7 +66,7 @@ def new_job(fn):
     return jid
 
 
-ACTIVE = {"separate": None, "render": None}
+ACTIVE = {"separate": None, "render": None, "align": None}
 
 
 def start_job(kind, fn):
@@ -269,6 +269,35 @@ class Handler(BaseHTTPRequestHandler):
                 if not lines:
                     return self._json({"error": "Không đọc được mốc giờ nào trong file .lrc"}, 400)
                 self._json({"lines": lines})
+
+            elif path == "/api/auto-align":
+                if not STATE["song_wav"]:
+                    return self._json({"error": "Chưa có bài hát"}, 400)
+                req = self._body_json()
+                texts = req.get("lines")
+                if not isinstance(texts, list) or not texts:
+                    return self._json({"error": "Chưa có lời để căn"}, 400)
+                texts = [str(t).strip() for t in texts]
+                if any(not t for t in texts) or len(texts) > 600:
+                    return self._json(
+                        {"error": "Lời có dòng trống hoặc quá nhiều câu"}, 400)
+                song_wav, duration = STATE["song_wav"], STATE["duration"]
+                models_dir = os.path.join(ROOT, "models")
+
+                def job(cb):
+                    from karaoke import align as alg
+                    heard = alg.transcribe_words(song_wav, duration, cb,
+                                                  models_dir)
+                    starts, ratio = alg.align_lines(heard, texts, duration)
+                    lines = [{"text": t, "start": s}
+                             for t, s in zip(texts, starts)]
+                    return {"lines": lines, "matched": ratio,
+                            "heard": len(heard)}
+                jid = start_job("align", job)
+                if jid is None:
+                    return self._json(
+                        {"error": "Đang tự căn dở — chờ xong đã"}, 409)
+                self._json({"job": jid})
 
             elif path == "/api/render":
                 req = self._body_json()

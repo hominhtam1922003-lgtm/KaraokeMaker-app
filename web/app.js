@@ -148,11 +148,59 @@ function updateTapStatus() {
     toast("Căn nhịp xong! Chỉnh kiểu chữ rồi xuất video thôi.");
   }
 }
+const SECTION_RE = /^(lyrics?|verse|chorus|hook|bridge|intro|outro|pre[-\s]?chorus|post[-\s]?chorus|refrain|điệp khúc|lời|phần|đoạn)\b/i;
+function cleanLyricLines(arr) {
+  // Bỏ dòng rác khi dán lời: nhãn mục Musixmatch (--:--Verse 1:), [Chorus],
+  // đường gạch trang trí... — chỉ giữ câu hát thật.
+  const out = [];
+  for (let s of arr) {
+    s = (s || "").trim();
+    if (!s) continue;
+    if (/^[-=*_~.·•\s]+$/.test(s)) continue;
+    if (/^[\[(].{0,40}[\])]$/.test(s) && s.split(/\s+/).length <= 6) continue;
+    if (s.length <= 30 && /:$/.test(s) && SECTION_RE.test(s)) continue;
+    if (s.startsWith("--:--")) {
+      const rest = s.slice(5).trim();
+      if (!rest || SECTION_RE.test(rest) || (rest.length <= 30 && /:$/.test(rest))) continue;
+      s = rest;
+    }
+    if (s) out.push(s);
+  }
+  return out;
+}
 $("btnUseLyrics").addEventListener("click", () => {
-  const raw = $("lyricsText").value.split("\n").map((s) => s.trim()).filter(Boolean);
-  if (!raw.length) return toast("Chưa có dòng lời nào.", true);
+  const all = $("lyricsText").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  const raw = cleanLyricLines(all);
+  if (!raw.length) return toast("Chưa có dòng lời nào (toàn dòng tiêu đề?).", true);
   setLines(raw.map((text) => ({ text })), false);
-  $("lyricsOk").textContent = `Đã nhận ${raw.length} câu — xuống bước 4 căn nhịp.`;
+  const dropped = all.length - raw.length;
+  $("lyricsOk").textContent = `Đã nhận ${raw.length} câu` +
+    (dropped > 0 ? ` (tự bỏ ${dropped} dòng tiêu đề/rác)` : "") +
+    " — xuống bước 4 căn nhịp.";
+});
+
+/* Tự căn nhịp bằng AI: server nghe bài hát, đối chiếu lời, trả mốc giờ. */
+$("btnAutoAlign").addEventListener("click", async () => {
+  if (!state.lines.length) return toast("Chưa có lời — làm bước 3 trước.", true);
+  if (!state.duration) return toast("Chưa có bài hát — làm bước 1 trước.", true);
+  $("btnAutoAlign").disabled = true;
+  try {
+    const { job } = await postJSON("/api/auto-align",
+      { lines: state.lines.map((l) => l.text) });
+    pollJob(job, $("alignProgress"), (res) => {
+      $("btnAutoAlign").disabled = false;
+      setLines(res.lines, true);
+      const pct = Math.round((res.matched || 0) * 100);
+      if (pct >= 50) {
+        toast(`AI căn xong (khớp ${pct}% số từ). Nghe thử — câu nào lệch thì bấm −0,1s/+0,1s ở từng câu để sửa.`);
+      } else {
+        toast(`AI căn xong nhưng chỉ khớp ${pct}% số từ — có thể lời chưa đúng bài. Kiểm tra kỹ từng câu hoặc căn tay.`, true);
+      }
+    }, (e) => { $("btnAutoAlign").disabled = false; toast(e, true); });
+  } catch (err) {
+    $("btnAutoAlign").disabled = false;
+    toast(err.message, true);
+  }
 });
 $("lrcFile").addEventListener("change", async (e) => {
   const file = e.target.files[0];

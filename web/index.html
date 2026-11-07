@@ -63,8 +63,15 @@
   <!-- BƯỚC 4 -->
   <section class="card locked" id="step4">
     <h2><span class="num">4</span> Căn nhịp</h2>
+    <div class="airow">
+      <div class="row">
+        <button class="primary" id="btnAutoAlign">✨ Tự căn bằng AI</button>
+        <span class="hint">AI nghe bài hát rồi tự gắn mốc giờ từng câu — bạn chỉ cần nghe lại và sửa câu nào lệch bằng nút −0,1s/+0,1s. Lần đầu dùng sẽ tải model ~470 MB (cần mạng), các lần sau chạy offline. Một bài mất vài phút tuỳ máy.</span>
+      </div>
+      <div class="progress" id="alignProgress" hidden><div class="bar"></div><span class="pct">0%</span></div>
+    </div>
     <div id="tapZone">
-      <p class="hint">Nghe nhạc rồi bấm nút <b>CÂU TIẾP</b> (hoặc phím <b>Space</b>) đúng lúc mỗi câu bắt đầu. Chữ trong video sẽ chạy theo từng từ trong câu.</p>
+      <p class="hint">Hoặc căn tay: nghe nhạc rồi bấm nút <b>CÂU TIẾP</b> (hoặc phím <b>Space</b>) đúng lúc mỗi câu bắt đầu. Chữ trong video sẽ chạy theo từng từ trong câu.</p>
       <div class="tapline" id="tapCurrent">—</div>
       <div class="row">
         <button class="primary big" id="btnTap">▶ Phát &amp; căn nhịp</button>

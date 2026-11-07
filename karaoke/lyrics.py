@@ -32,9 +32,41 @@ def parse_lrc(text):
     return out
 
 
+_SECTION = re.compile(
+    r"(lyrics?|verse|chorus|hook|bridge|intro|outro|pre[-\s]?chorus|"
+    r"post[-\s]?chorus|refrain|điệp khúc|lời|phần|đoạn)\b", re.IGNORECASE)
+_SEPARATOR = re.compile(r"^[-=*_~.·•\s]+$")
+_BRACKETED = re.compile(r"^[\[(].{0,40}[\])]$")
+
+
+def clean_line(line):
+    """Một dòng lời dán vào -> câu hát sạch, hoặc None nếu là dòng rác:
+    nhãn mục kiểu Musixmatch (--:--Verse 1:, --:--Lyrics:), [Chorus],
+    (Hook), đường gạch trang trí, nhãn 'Verse 1:' đứng một mình."""
+    s = (line or "").strip()
+    if not s or _SEPARATOR.match(s):
+        return None
+    if _BRACKETED.match(s) and len(s.split()) <= 6:
+        return None
+    if s.endswith(":") and len(s) <= 30 and _SECTION.match(s):
+        return None
+    if s.startswith("--:--"):
+        rest = s[len("--:--"):].strip()
+        if not rest or _SECTION.match(rest) or (len(rest) <= 30
+                                                and rest.endswith(":")):
+            return None
+        s = rest
+    return s or None
+
+
 def parse_plain(text):
-    """Lời dán tay: mỗi dòng một câu, bỏ dòng trống."""
-    return [ln.strip() for ln in text.replace("\r\n", "\n").split("\n") if ln.strip()]
+    """Lời dán tay: mỗi dòng một câu, bỏ dòng trống và dòng rác (nhãn mục)."""
+    out = []
+    for ln in text.replace("\r\n", "\n").split("\n"):
+        s = clean_line(ln)
+        if s:
+            out.append(s)
+    return out
 
 
 def split_words(line):
