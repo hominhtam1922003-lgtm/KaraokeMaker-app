@@ -250,10 +250,15 @@ def _run_worker(args, progress_cb):
     stall_s = _env_seconds("KARAOKE_WHISPER_STALL_S", 120)
     beat_s = _env_seconds("KARAOKE_WHISPER_HEARTBEAT_S", 20)
     try:
+        from karaoke.media import no_window_kwargs
+        nw = no_window_kwargs()
+    except Exception:  # noqa: BLE001
+        nw = {}
+    try:
         proc = subprocess.Popen(
             _worker_cmd() + args, stdout=subprocess.PIPE,
             stderr=subprocess.PIPE, text=True, encoding="utf-8",
-            errors="replace")
+            errors="replace", **nw)
     except Exception as e:  # noqa: BLE001
         raise _WorkerSpawnError(
             "Không khởi động được AI nghe lời: " + str(e)) from e
@@ -414,7 +419,9 @@ def _transcribe_inprocess(wav_path, duration=0.0, progress_cb=None,
     try:
         segs, _info = model.transcribe(
             wav_path, word_timestamps=True, beam_size=1, vad_filter=False,
-            condition_on_previous_text=False)
+            condition_on_previous_text=False,
+            initial_prompt="Sau đây là lời một bài hát tiếng Việt, được hát "
+                           "rõ ràng và viết có dấu đầy đủ.")
         for seg in segs:
             words = [{"w": (wd.word or "").strip(),
                       "start": float(wd.start), "end": float(wd.end)}
@@ -453,6 +460,9 @@ def segments_to_lines(segments):
         if (text.startswith("[") and text.endswith("]")) or \
                 (text.startswith("(") and text.endswith(")")):
             continue  # [âm nhạc], (tiếng vỗ tay)... không phải lời hát
+        from karaoke import lyrics as _lyr
+        if _lyr.is_junk_line(text):
+            continue  # lời kêu gọi của kênh (subscribe...) — không phải lời hát
         chunks, cur = [], []
         for wd in words:
             cur.append(wd)

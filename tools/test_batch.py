@@ -8,6 +8,7 @@ import os
 import subprocess
 import sys
 import time
+import urllib.parse
 import urllib.request
 
 ROOT = os.path.join(os.path.dirname(__file__), "..")
@@ -101,6 +102,25 @@ def req(base, method, path, body=None):
             return e.code, {}, e.headers
 
 
+def req_raw(base, path, data, headers):
+    r = urllib.request.Request(base + path, data=data, method="POST")
+    for k, v in headers.items():
+        r.add_header(k, v)
+    try:
+        with urllib.request.urlopen(r, timeout=60) as resp:
+            b = resp.read()
+            try:
+                return resp.status, json.loads(b or b"{}"), resp.headers
+            except Exception:
+                return resp.status, b, resp.headers
+    except urllib.error.HTTPError as e:
+        b = e.read()
+        try:
+            return e.code, json.loads(b or b"{}"), e.headers
+        except Exception:
+            return e.code, {}, e.headers
+
+
 def main():
     make_fixture()
     make_stubs()
@@ -159,6 +179,40 @@ def main():
         st, _r, _h = req(base, "GET",
                          f"/api/batch/{errs[0]['id']}/video" if errs else "/x")
         check("batch: bài lỗi không có video -> 404", st == 404)
+
+        # --- v3: hàng loạt từ FILE trên máy + lưu video vào máy ---
+        raw = open("/tmp/ktest/mix.wav", "rb").read()
+        st, r, _h = req_raw(base, "/api/batch-file", raw, {
+            "X-File-Name": urllib.parse.quote("Bài File Test.wav"),
+            "X-Batch-Opts": json.dumps({
+                "sep_mode": "fast", "style": {},
+                "bg": {"type": "gradient", "value": "neon"}})})
+        check("batch-file: nhận file", st == 200 and bool(r.get("item")),
+              str(r)[:100])
+        fid = r.get("item")
+        fitem = None
+        t0 = time.time()
+        while time.time() - t0 < 300:
+            _s, data, _h = req(base, "GET", "/api/batch")
+            fitem = next((i for i in data.get("items", [])
+                          if i["id"] == fid), None)
+            if fitem and fitem["status"] in ("done", "error"):
+                break
+            time.sleep(1.5)
+        check("batch-file: chạy xong", bool(fitem) and fitem["status"] == "done",
+              str(fitem)[:200])
+        check("batch-file: kind=file + title từ tên file",
+              bool(fitem) and fitem.get("kind") == "file"
+              and fitem.get("title") == "Bài File Test", str(fitem)[:150])
+        st, r, _h = req(base, "POST", f"/api/batch/{fid}/save", {})
+        saved = (r.get("path") or "") if isinstance(r, dict) else ""
+        check("batch-file: lưu video vào máy",
+              st == 200 and saved.endswith(".mp4") and os.path.exists(saved),
+              str(r)[:120])
+        st, r, _h = req(base, "POST", "/api/open-folder", {})
+        check("open-folder ok", st == 200 and r.get("ok") is True, str(r)[:80])
+        st, r, _h = req(base, "POST", "/api/save-video", {})
+        check("save-video chưa có video -> 400", st == 400, str(r)[:80])
     finally:
         proc.terminate()
     print()

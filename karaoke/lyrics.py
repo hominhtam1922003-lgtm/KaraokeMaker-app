@@ -59,6 +59,28 @@ def clean_line(line):
     return s or None
 
 
+_JUNK_PATTERNS = [re.compile(p, re.IGNORECASE) for p in (
+    r"subscribe",
+    r"đăng\s*ký\s*kênh|nhấn\s*(chuông|đăng\s*ký)|bấm\s*(chuông|đăng\s*ký)",
+    r"để\s*không\s*bỏ\s*lỡ|không\s*bỏ\s*lỡ\s*.*video",
+    r"like\s*(và|&|and)\s*share|ủng\s*hộ\s*kênh",
+    r"cảm\s*ơn\s*(các\s*bạn|mọi\s*người|quý\s*vị)\s*đã",
+    r"https?://|www\.",
+)]
+
+
+def is_junk_line(text):
+    """True nếu dòng KHÔNG phải lời hát mà là lời kêu gọi của kênh/người
+    đăng video (subscribe, nhấn chuông, cảm ơn đã xem...) — AI chép lời
+    thường chép cả đoạn nói mở đầu/kết thúc video; những dòng này phải bị
+    loại khỏi lời karaoke (phản ánh máy thật 07/11/2026). Mẫu bắt chặt
+    theo ngữ cảnh kênh để tránh giết nhầm lời hát thật."""
+    t = (text or "").strip()
+    if not t:
+        return True
+    return any(p.search(t) for p in _JUNK_PATTERNS)
+
+
 def parse_plain(text):
     """Lời dán tay: mỗi dòng một câu, bỏ dòng trống và dòng rác (nhãn mục)."""
     out = []
@@ -112,9 +134,12 @@ def _word_start(wt):
 def build_ass(timed_lines, opts=None):
     """timed_lines: [{'start','end','text', tuỳ chọn 'words': [(start,end)...]}].
     opts: color (màu đã hát), base_color (màu chưa hát), outline_color, size,
-    font, margin_v, effect ('sweep' = quét mượt \\kf | 'pop' = nhảy từng từ \\k),
+    font, margin_v, effect ('sweep' = quét mượt \\kf | 'pop' = nhảy từng từ
+    \\k | 'zoom' = từ đang hát phóng to | 'type' = hiện từng ký tự),
     fade (bool: mở/đóng câu bằng mờ dần), align (2 đáy | 8 đỉnh | 5 giữa),
-    outline_w, two_line (hiện câu kế tiếp mờ ở dưới), title (thẻ tên bài mở đầu)."""
+    outline_w, two_line (hiện câu kế tiếp mờ ở dưới), title (thẻ tên bài
+    mở đầu), countdown (chấm đếm ngược trước câu sau quãng nghỉ — hỗ trợ
+    người hát bắt nhịp)."""
     opts = opts or {}
     sung = _ass_color(opts.get("color", "#FFD400"))       # màu sau khi hát qua (highlight)
     base = _ass_color(opts.get("base_color", "#FFFFFF"),
@@ -127,11 +152,17 @@ def build_ass(timed_lines, opts=None):
     margin_v = _safe_int(opts.get("margin_v", 70), 70, 0, 400)
     align = _safe_int(opts.get("align", 2), 2, 1, 9)
     outline_w = _safe_int(opts.get("outline_w", 3), 3, 0, 8)
-    tag = "kf" if str(opts.get("effect", "sweep")) != "pop" else "k"
+    effect = str(opts.get("effect", "sweep"))
+    if effect not in ("sweep", "pop", "zoom", "type"):
+        effect = "sweep"
+    tag = "kf" if effect == "sweep" else "k"
     fade = bool(opts.get("fade", True))
     two_line = bool(opts.get("two_line", False))
+    countdown = bool(opts.get("countdown", False))
     title = str(opts.get("title") or "").strip()
-    play_x, play_y = 1920, 1080
+    play_x = _safe_int(opts.get("play_x", 1920), 1920, 240, 4000)
+    play_y = _safe_int(opts.get("play_y", 1080), 1080, 240, 4000)
+    duet = _ass_color(opts["duet_color"]) if opts.get("duet_color") else None
 
     style_fmt = (
         "[V4+ Styles]\n"
@@ -151,6 +182,12 @@ def build_ass(timed_lines, opts=None):
         style_fmt += (
             f"Style: KaraTitle,{font},{int(size * 1.25)},{sung},{base},"
             f"{outline},&H64000000,-1,0,0,0,100,100,0,0,1,3,2,5,40,40,0,1\n"
+        )
+    if countdown:
+        style_fmt += (
+            f"Style: Dots,{font},{max(24, int(size * 0.55))},{sung},{sung},"
+            f"{outline},&H64000000,-1,0,0,0,100,100,0,0,1,2,0,{align},40,40,"
+            f"{margin_v + size + 56},1\n"
         )
 
     header = (
@@ -188,7 +225,9 @@ def build_ass(timed_lines, opts=None):
             f"{{\\fad(300,400)}}{safe_text(title)}")
     for idx, (start, end, text, words, wtimes) in enumerate(norm):
         total_cs = max(len(words), int(round((end - start) * 100)))
-        parts = []
+        # slots: (từ, thời lượng cs, mốc bắt đầu cs tính từ đầu câu)
+        slots = []
+        lead = 0
         if wtimes and len(wtimes) == len(words):
             pts = []
             for wt in wtimes:
@@ -198,16 +237,14 @@ def build_ass(timed_lines, opts=None):
                 pts.append(p)
             lead = int(round((pts[0] - start) * 100)) if pts[0] > start + 0.02 else 0
             lead = max(0, min(lead, total_cs - len(words)))
-            if lead:
-                parts.append(f"{{\\k{lead}}}")
             used = lead
             for i, w in enumerate(words):
                 if i == len(words) - 1:
                     dur = max(1, total_cs - used)
                 else:
                     dur = max(1, int(round((pts[i + 1] - pts[i]) * 100)))
-                    used += dur
-                parts.append(f"{{\\{tag}{dur}}}{safe_text(w)}")
+                slots.append((w, dur, used))
+                used += dur
         else:
             weights = [_word_weight(w) for w in words]
             wsum = sum(weights) or 1
@@ -217,13 +254,51 @@ def build_ass(timed_lines, opts=None):
                     dur = max(1, total_cs - used)
                 else:
                     dur = max(1, int(round(total_cs * weights[i] / wsum)))
-                    used += dur
-                parts.append(f"{{\\{tag}{dur}}}{safe_text(w)}")
+                slots.append((w, dur, used))
+                used += dur
+        parts = []
+        if lead:
+            parts.append(f"{{\\k{lead}}}")
+        for w, dur, off in slots:
+            sw = safe_text(w)
+            if effect == "zoom":
+                dur_ms, off_ms = dur * 10, off * 10
+                if dur_ms >= 60:
+                    up = max(1, min(120, dur_ms // 2))
+                    zoom = (
+                        "{\\k" + str(dur)
+                        + f"\\t({off_ms},{off_ms + up},\\fscx120\\fscy120)"
+                        + f"\\t({off_ms + dur_ms - up},{off_ms + dur_ms},"
+                          "\\fscx100\\fscy100)}")
+                    parts.append(zoom + sw)
+                else:
+                    parts.append(f"{{\\k{dur}}}{sw}")
+            elif effect == "type" and len(sw) > 1:
+                n = len(sw)
+                prev, seg = 0, ""
+                for j, ch in enumerate(sw):
+                    upto = int(round(dur * (j + 1) / n))
+                    seg += f"{{\\k{upto - prev}}}{ch}"
+                    prev = upto
+                parts.append(seg)
+            else:
+                parts.append(f"{{\\{tag}{dur}}}{sw}")
         body = " ".join(parts)
         if fade:
             body = "{\\fad(120,180)}" + body
+        if duet and idx % 2 == 1:
+            # Song ca: câu lẻ tô màu highlight thứ hai (màu người hát 2)
+            body = "{\\1c" + duet + "}" + body
         events.append(
             f"Dialogue: 1,{_ass_time(start)},{_ass_time(end)},Kara,,0,0,0,,{body}")
+        if countdown:
+            prev_end = norm[idx - 1][1] if idx > 0 else 0.0
+            if start - prev_end >= 1.6:
+                for k, dots in enumerate(("●", "● ●", "● ● ●")):
+                    d0 = start - 1.5 + 0.5 * k
+                    events.append(
+                        f"Dialogue: 0,{_ass_time(d0)},{_ass_time(d0 + 0.5)},"
+                        f"Dots,,0,0,0,,{dots}")
         if two_line and idx + 1 < len(norm):
             ntext = safe_text(norm[idx + 1][2])
             events.append(

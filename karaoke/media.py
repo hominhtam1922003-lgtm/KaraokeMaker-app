@@ -7,6 +7,15 @@ import subprocess
 import sys
 
 
+def no_window_kwargs():
+    """Kwargs cho subprocess để tiến trình phụ KHÔNG bật cửa sổ console
+    đen trên Windows (sự cố máy thật 07/11/2026: cửa sổ ffmpeg.exe nhảy
+    lên che app). Nền tảng khác: rỗng."""
+    if sys.platform.startswith("win"):
+        return {"creationflags": 0x08000000}  # CREATE_NO_WINDOW
+    return {}
+
+
 def ffmpeg_bin():
     # Khi đóng gói bằng PyInstaller, ffmpeg nằm cạnh exe / trong bundle.
     candidates = []
@@ -34,7 +43,8 @@ def probe_duration(path):
     try:
         cmd = [ffprobe_bin(), "-v", "error", "-show_entries", "format=duration",
                "-of", "json", path]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                           **no_window_kwargs())
         data = json.loads(r.stdout or "{}")
         return float(data.get("format", {}).get("duration", 0.0) or 0.0)
     except Exception:  # noqa: BLE001
@@ -51,7 +61,8 @@ def check_readable(path):
     try:
         cmd = [ffmpeg_bin(), "-v", "error", "-i", path,
                "-t", "0.5", "-f", "null", "-"]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=25,
+                           **no_window_kwargs())
         return r.returncode == 0
     except Exception:  # noqa: BLE001
         return False
@@ -67,7 +78,8 @@ def _run(cmd, progress_cb=None, duration=None, label="", cwd=None, timeout=None)
     if progress_cb and duration:
         cmd = cmd[:1] + ["-progress", "pipe:1", "-nostats"] + cmd[1:]
         proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                text=True, bufsize=1, cwd=cwd)
+                                text=True, bufsize=1, cwd=cwd,
+                                **no_window_kwargs())
         killed = []
 
         def _kill():
@@ -105,7 +117,8 @@ def _run(cmd, progress_cb=None, duration=None, label="", cwd=None, timeout=None)
     else:
         try:
             r = subprocess.run(cmd, capture_output=True, text=True,
-                               timeout=timeout or 3600, cwd=cwd)
+                               timeout=timeout or 3600, cwd=cwd,
+                               **no_window_kwargs())
         except subprocess.TimeoutExpired:
             raise RuntimeError(
                 f"ffmpeg quá thời gian ({timeout}s) ở bước {label} — "
@@ -143,29 +156,61 @@ def center_cut(in_wav, out_wav, progress_cb=None, duration=None):
 
 
 GRADIENTS = {
-    "demtim": ("Đêm tím", ["0x160a2e", "0x5b2a86"]),
-    "hoanghon": ("Hoàng hôn", ["0x2e1a47", "0xb7416b", "0xf2a65a"]),
-    "biensau": ("Biển sâu", ["0x081c2c", "0x14607e"]),
-    "rungdem": ("Rừng đêm", ["0x0a1f14", "0x2e7d4f"]),
-    "neon": ("Hồng neon", ["0x14061f", "0xa4136b"]),
+    "demtim": ("Đêm tím", ["0x0d0518", "0x3d1470", "0x8b3fbf"]),
+    "hoanghon": ("Hoàng hôn", ["0x1d0b38", "0xb7416b", "0xf7b733"]),
+    "biensau": ("Biển sâu", ["0x02101f", "0x0a4d68", "0x088f8f"]),
+    "rungdem": ("Rừng đêm", ["0x04140a", "0x14532d", "0x3f9d4e"]),
+    "neon": ("Hồng neon", ["0x0f0219", "0x7b1e6e", "0xff2e88"]),
+    "thanhpho": ("Đêm đô thị", ["0x050914", "0x1b2a6b", "0x3d5afe"]),
+    "vangkim": ("Vàng kim", ["0x140b02", "0x6e4410", "0xd9a441"]),
+    "hongdao": ("Hồng đào", ["0x1c0714", "0x83325c", "0xf78fb3"]),
+    "xanhmint": ("Xanh mint", ["0x02120e", "0x0b5563", "0x2ec4b6"]),
+    "domlua": ("Đốm lửa", ["0x120202", "0x7a1f0d", "0xf46036"]),
 }
 
 
-def make_gradient_bg(kind, out_png):
-    """Tạo ảnh nền gradient 1920x1080 theo mẫu (kèm vignette + nhiễu hạt nhẹ
-    cho cảm giác cao cấp). kind lạ -> dùng 'demtim'."""
-    _label, colors = GRADIENTS.get(kind, GRADIENTS["demtim"])
-    src = "gradients=s=1920x1080:" + ":".join(
+def _gradients_src(colors, w, h, animated=False):
+    src = f"gradients=s={w}x{h}:" + ":".join(
         f"c{i}={c}" for i, c in enumerate(colors))
-    src += f":nb_colors={len(colors)}:x0=0:y0=0:x1=1920:y1=1080"
+    src += f":nb_colors={len(colors)}"
+    if not animated:
+        src += f":x0=0:y0=0:x1={w}:y1={h}"
+    return src
+
+
+def make_gradient_bg(kind, out_png, size=(1920, 1080)):
+    """Tạo ảnh nền gradient theo mẫu (3 điểm màu chuyển sắc rõ + vignette +
+    nhiễu hạt nhẹ cho cảm giác cao cấp). kind lạ -> 'demtim'."""
+    _label, colors = GRADIENTS.get(kind, GRADIENTS["demtim"])
+    src = _gradients_src(colors, int(size[0]), int(size[1]))
     cmd = [ffmpeg_bin(), "-y", "-v", "error", "-f", "lavfi", "-i", src,
            "-vf", "vignette=angle=PI/5,noise=alls=5:allf=t",
            "-frames:v", "1", out_png]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60,
+                       **no_window_kwargs())
     if r.returncode != 0 or not os.path.exists(out_png):
         raise RuntimeError("Không tạo được nền gradient: "
                            + (r.stderr or "")[-200:])
     return out_png
+
+
+def make_gradient_video(kind, out_mp4, duration, size=(1280, 720)):
+    """Tạo video nền gradient ĐỘNG (màu tự chuyển sắc chậm) dài tối đa 30
+    giây để render lặp vòng — nền sống động thay vì một tấm ảnh tĩnh."""
+    _label, colors = GRADIENTS.get(kind, GRADIENTS["demtim"])
+    src = _gradients_src(colors, int(size[0]), int(size[1]), animated=True)
+    dur = max(5.0, min(float(duration or 20), 30.0))
+    cmd = [ffmpeg_bin(), "-y", "-v", "error", "-f", "lavfi", "-i", src,
+           "-vf", "vignette=angle=PI/5",
+           "-t", f"{dur:.1f}", "-r", "30", "-c:v", "libx264",
+           "-preset", "veryfast", "-crf", "23", "-pix_fmt", "yuv420p",
+           out_mp4]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=300,
+                       **no_window_kwargs())
+    if r.returncode != 0 or not os.path.exists(out_mp4):
+        raise RuntimeError("Không tạo được nền động: "
+                           + (r.stderr or "")[-200:])
+    return out_mp4
 
 
 def mix_with_guide(inst_wav, orig_wav, guide_pct, out_wav):
@@ -184,24 +229,28 @@ def mix_with_guide(inst_wav, orig_wav, guide_pct, out_wav):
     _run(cmd, label="trộn giọng dẫn")
 
 
-def render_video(bg, audio_wav, ass_path, out_mp4, duration, progress_cb=None):
+def render_video(bg, audio_wav, ass_path, out_mp4, duration, progress_cb=None,
+                 size=(1920, 1080), progress_bar=False):
     """bg: {'type': 'color'|'image'|'video', 'value': hex hoặc đường dẫn}.
-    Đốt chữ ASS karaoke lên nền 1920x1080, nhạc là audio_wav."""
+    Đốt chữ ASS karaoke lên nền theo size (mặc định 1920x1080; có thể là
+    dọc 1080x1920 / vuông 1080x1080), nhạc là audio_wav. progress_bar:
+    vẽ thanh tiến trình mảnh ở mép trên video (kiểu Youka)."""
     ff = ffmpeg_bin()
+    w, h = int(size[0]), int(size[1])
     if bg.get("type") in ("image", "video") and not check_readable(bg.get("value") or ""):
         raise RuntimeError("File nền không đọc được — hãy chọn file khác")
     cmd = [ff, "-y", "-v", "error"]
     if bg.get("type") == "image":
         cmd += ["-loop", "1", "-framerate", "30", "-i", bg["value"]]
-        vfilter = ("[0:v]scale=1920:1080:force_original_aspect_ratio=increase,"
-                   "crop=1920:1080,setsar=1[bg];")
+        vfilter = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
+                   f"crop={w}:{h},setsar=1[bg];")
     elif bg.get("type") == "video":
         cmd += ["-stream_loop", "-1", "-i", bg["value"]]
-        vfilter = ("[0:v]scale=1920:1080:force_original_aspect_ratio=increase,"
-                   "crop=1920:1080,fps=30,setsar=1[bg];")
+        vfilter = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
+                   f"crop={w}:{h},fps=30,setsar=1[bg];")
     else:
         color = (bg.get("value") or "#0b0e1a").replace("#", "0x")
-        cmd += ["-f", "lavfi", "-i", f"color=c={color}:s=1920x1080:r=30"]
+        cmd += ["-f", "lavfi", "-i", f"color=c={color}:s={w}x{h}:r=30"]
         vfilter = "[0:v]setsar=1[bg];"
     # Đường dẫn ASS KHÔNG nhúng thẳng vào filter (ký tự lạ như ':' của ổ đĩa
     # Windows, dấu cách, nháy đơn sẽ phá cú pháp filter của ffmpeg). Chạy
@@ -213,8 +262,19 @@ def render_video(bg, audio_wav, ass_path, out_mp4, duration, progress_cb=None):
         bg = {**bg, "value": os.path.abspath(bg["value"])}
     ass_name = os.path.basename(ass_path)
     ass_dir = os.path.dirname(os.path.abspath(ass_path))
-    vfilter += f"[bg]ass='{ass_name}'[vout]"
-    cmd += ["-i", audio_wav,
+    bar_input = []
+    if progress_bar and duration > 0:
+        # Thanh tiến trình: dải vàng full bề ngang được phủ bằng overlay
+        # với x trượt theo thời gian (ẩn dần ngoài mép trái -> hiện dần).
+        # KHÔNG dùng drawbox/crop: cả hai đều không có biến t theo khung
+        # cho tham số kích thước (đã đo thực tế trên bản ffmpeg này);
+        # overlay thì có.
+        vfilter += (f"[bg]ass='{ass_name}'[vsub];"
+                    f"[vsub][2:v]overlay=x='(t/{duration:.3f}-1)*overlay_w':y=0[vout]")
+        bar_input = ["-f", "lavfi", "-i", f"color=c=0xFFD400:s={w}x6:r=30"]
+    else:
+        vfilter += f"[bg]ass='{ass_name}'[vout]"
+    cmd += ["-i", audio_wav] + bar_input + [
             "-filter_complex", vfilter,
             "-map", "[vout]", "-map", "1:a",
             "-c:v", "libx264", "-preset", "medium", "-crf", "20",

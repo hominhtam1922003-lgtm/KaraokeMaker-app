@@ -153,6 +153,21 @@ check("segments: words carry times & text joins",
 check("segments: sorted by start",
       [l["start"] for l in lines9] == sorted(l["start"] for l in lines9))
 
+# v3: segments_to_lines tự lọc dòng rác của kênh (subscribe / cảm ơn)
+segs_junk = [
+    seg("Hãy subscribe cho kênh nhạc để không bỏ lỡ video mới",
+        ["Hãy", "subscribe", "cho", "kênh"], 1.0),
+    seg("Cảm ơn các bạn đã đón xem", ["Cảm", "ơn", "các", "bạn"], 20.0),
+    seg("Ngày mai em đi biển nhớ", ["Ngày", "mai", "em", "đi"], 30.0),
+]
+lj = alg.segments_to_lines(segs_junk)
+check("segments: subscribe junk dropped",
+      all("subscribe" not in l["text"] for l in lj), str(lj)[:150])
+check("segments: cam-on junk dropped",
+      all("Cảm ơn" not in l["text"] for l in lj), str(lj)[:150])
+check("segments: real line kept after junk filter",
+      len(lj) == 1 and "Ngày mai" in lj[0]["text"], str(lj)[:150])
+
 print()
 print("FAILED:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

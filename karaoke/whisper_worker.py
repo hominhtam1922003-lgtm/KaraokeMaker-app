@@ -109,7 +109,9 @@ def _segments(src, models_dir, duration, cpu_threads=0, word_ts=True,
         # lâu trên đoạn nhạc (trông như treo). Tắt là chuẩn cho nhạc.
         segs, _info = model.transcribe(
             source, word_timestamps=word_ts, beam_size=1, vad_filter=False,
-            condition_on_previous_text=False)
+            condition_on_previous_text=False,
+            initial_prompt="Sau đây là lời một bài hát tiếng Việt, được hát "
+                           "rõ ràng và viết có dấu đầy đủ.")
         for seg in segs:
             words = [{"w": (wd.word or "").strip(),
                       "start": float(wd.start), "end": float(wd.end)}

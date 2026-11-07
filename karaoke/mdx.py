@@ -129,8 +129,11 @@ def save_wav_f32(path, data):
 
 
 def separate_mdx(in_wav, out_wav, model_path=None, progress_cb=None, order="A",
-                 n_fft=None):
-    """Tách instrumental từ in_wav, ghi ra out_wav. progress_cb(pct, label)."""
+                 n_fft=None, vocal_out=None):
+    """Tách instrumental từ in_wav, ghi ra out_wav. progress_cb(pct, label).
+    Nếu có vocal_out: ghi thêm stem GIỌNG HÁT = bản gốc trừ instrumental
+    (cách suy stem phụ chuẩn của UVR) — dùng để AI chép lời trên giọng đã
+    tách, nghe rõ chữ hơn hẳn so với chép trên bản phối đầy nhạc."""
     import onnxruntime as ort
 
     n_fft = int(n_fft or N_FFT)
@@ -183,6 +186,10 @@ def separate_mdx(in_wav, out_wav, model_path=None, progress_cb=None, order="A",
     full = np.concatenate(
         [acc, np.zeros((2, pad_bins, total_t), dtype=np.complex64)], axis=1)
     outs = [istft(full[ch], n_fft=n_fft, length=n_samples) / scale for ch in range(2)]
-    save_wav_f32(out_wav, np.stack(outs))
+    inst = np.stack(outs)
+    save_wav_f32(out_wav, inst)
+    if vocal_out:
+        vocal = np.clip(audio / scale - inst, -1.0, 1.0)
+        save_wav_f32(vocal_out, vocal.astype(np.float32))
     if progress_cb:
         progress_cb(100.0, "tách beat AI")
