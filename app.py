@@ -1,10 +1,12 @@
 """Karaoke Maker — app PC: tách beat AI, căn nhịp lời, xuất video karaoke.
 
-Chạy một máy chủ web local (chỉ 127.0.0.1) và mở giao diện trong trình duyệt.
-Đóng gói thành .exe bằng PyInstaller (xem KaraokeMaker.spec).
+Ruột xử lý chạy native trên máy (máy chủ local 127.0.0.1 + FFmpeg + model AI);
+vỏ hiển thị ưu tiên CỬA SỔ APP RIÊNG (pywebview), không mở được mới lùi về
+trình duyệt. Đóng gói thành .exe bằng PyInstaller (xem KaraokeMaker.spec).
 """
 import json
 import os
+import queue
 import sys
 import threading
 import traceback
@@ -28,16 +30,25 @@ sys.path.insert(0, BASE if not getattr(sys, "frozen", False) else sys._MEIPASS)
 from karaoke import lyrics as lyr  # noqa: E402
 from karaoke import media, mdx  # noqa: E402
 
-STATE = {
-    "song_name": None,
-    "song_wav": None,       # WAV làm việc trích từ file gốc
-    "duration": 0.0,
-    "inst_wav": None,       # WAV beat đã tách
-    "inst_mode": None,
-    "bg_image": None,
-    "bg_video": None,
-    "out_mp4": None,
-}
+def new_ctx(workdir):
+    """Một ngữ cảnh làm việc độc lập (thư mục riêng + trạng thái riêng) —
+    phiên chính dùng STATE/WORK, mỗi bài trong hàng loạt dùng ctx riêng để
+    chạy song song không giẫm file của nhau."""
+    os.makedirs(workdir, exist_ok=True)
+    return {
+        "_work": workdir,
+        "song_name": None,
+        "song_wav": None,       # WAV làm việc trích từ file gốc
+        "duration": 0.0,
+        "inst_wav": None,       # WAV beat đã tách
+        "inst_mode": None,
+        "bg_image": None,
+        "bg_video": None,
+        "out_mp4": None,
+    }
+
+
+STATE = new_ctx(WORK)
 JOBS = {}
 LOCK = threading.Lock()
 
@@ -66,7 +77,8 @@ def new_job(fn):
     return jid
 
 
-ACTIVE = {"separate": None, "render": None, "align": None, "autoall": None}
+ACTIVE = {"separate": None, "render": None, "align": None, "autoall": None,
+          "autolink": None}
 
 
 def any_job_running():
@@ -75,6 +87,113 @@ def any_job_running():
     with LOCK:
         return any((JOBS.get(ACTIVE.get(k) or "") or {}).get("status") == "running"
                    for k in ACTIVE)
+
+
+def _scaled(cb, lo, hi):
+    """Bọc callback tiến độ: ánh xạ 0-100 của một công đoạn vào [lo, hi]
+    của toàn trình (để thanh tiến độ chạy liền mạch qua nhiều công đoạn)."""
+    return lambda p, label="": cb(lo + (hi - lo) * float(p) / 100.0, label)
+
+
+def _load_song_file(ctx, src, name):
+    """Nạp một file nguồn làm bài hát của ctx: trích WAV làm việc trong thư
+    mục của ctx. Trả về thời lượng (giây)."""
+    wav = os.path.join(ctx["_work"], "song.wav")
+    media.extract_audio(src, wav)
+    ctx.update(song_name=name, song_wav=wav,
+               duration=media.probe_duration(wav),
+               inst_wav=None, inst_mode=None, out_mp4=None)
+    return ctx["duration"]
+
+
+_WHISPER_LOCK = threading.Lock()
+_WHISPER_READY = False
+
+
+def _ensure_whisper(models_dir):
+    """Nạp/tải model Whisper MỘT lần dưới khoá — nhiều bài chạy song song
+    không được tải trùng (tránh hỏng file model khi tải dở cùng lúc)."""
+    global _WHISPER_READY
+    if _WHISPER_READY:
+        return
+    with _WHISPER_LOCK:
+        if _WHISPER_READY:
+            return
+        from karaoke import align as alg
+        alg.load_model_only(models_dir)
+        _WHISPER_READY = True
+
+
+def resolve_bg(bg_req, ctx):
+    """Chọn nền video từ yêu cầu: ảnh/video đã có trong ctx, mẫu gradient
+    sẵn có (tạo ảnh trong thư mục của ctx), hoặc màu trơn."""
+    bg_req = bg_req or {}
+    t = bg_req.get("type")
+    if t == "image" and ctx.get("bg_image"):
+        return {"type": "image", "value": ctx["bg_image"]}
+    if t == "video" and ctx.get("bg_video"):
+        return {"type": "video", "value": ctx["bg_video"]}
+    if t == "gradient":
+        kind = str(bg_req.get("value") or "demtim")
+        path = os.path.join(ctx["_work"], f"grad_{kind}.png")
+        if not os.path.exists(path):
+            media.make_gradient_bg(kind, path)
+        return {"type": "image", "value": path}
+    return {"type": "color", "value": bg_req.get("value", "#0b0e1a")}
+
+
+def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
+                 video_url="/api/video"):
+    """TOÀN TRÌNH TỰ HÀNH trên bài hát đã nạp trong ctx: tách beat -> nghe &
+    chép lời -> gắn mốc giờ từng câu/từ -> xuất video. texts=None nghĩa là
+    để AI tự chép lời; có texts thì đối chiếu lời đó. Trả về dict kết quả."""
+    work = ctx["_work"]
+    song_wav, duration = ctx["song_wav"], ctx["duration"]
+    models_dir = os.path.join(ROOT, "models")
+    inst_out = os.path.join(work, "inst.wav")
+    ass_path = os.path.join(work, "lyrics.ass")
+    out_mp4 = os.path.join(work, "karaoke.mp4")
+    cb(1, "Đang tách beat...")
+    if sep_mode == "fast":
+        media.center_cut(song_wav, inst_out, _scaled(cb, 2, 30), duration)
+    else:
+        mdx.separate_mdx(song_wav, inst_out, progress_cb=_scaled(cb, 2, 30))
+    ctx.update(inst_wav=inst_out, inst_mode=sep_mode)
+    _ensure_whisper(models_dir)
+    from karaoke import align as alg
+    segs = alg.transcribe_segments(song_wav, duration, _scaled(cb, 32, 68),
+                                   models_dir)
+    cb(70, "Đang gắn mốc giờ từng câu...")
+    if texts:
+        heard = [w for s in segs for w in s["words"]]
+        full = alg.align_full(heard, texts, duration)
+        raw = [{"text": t, "start": s, "words": [list(x) for x in ws]}
+               for t, s, ws in zip(texts, full["starts"], full["words"])]
+        matched, source = full["ratio"], "user"
+    else:
+        raw = alg.segments_to_lines(segs)
+        matched, source = 1.0, "ai"
+    if not raw:
+        raise ValueError(
+            "Không tạo được lời từ bài này — thử dán lời vào bước 3 rồi "
+            "bấm Tự căn bằng AI")
+    timed = lyr.assign_ends(raw, duration)
+    st = dict(style)
+    if title:
+        st["title"] = title
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(lyr.build_ass(timed, st))
+    cb(80, "Đang xuất video...")
+    audio = inst_out
+    if guide > 0:
+        mixed = os.path.join(work, "mixed.wav")
+        media.mix_with_guide(inst_out, song_wav, guide, mixed)
+        audio = mixed
+    media.render_video(bg, audio, ass_path, out_mp4, duration,
+                       _scaled(cb, 80, 100))
+    ctx["out_mp4"] = out_mp4
+    return {"video": video_url, "lines": timed, "matched": matched,
+            "source": source, "count": len(timed)}
 
 
 def start_job(kind, fn):
@@ -87,6 +206,80 @@ def start_job(kind, fn):
     jid = new_job(fn)
     ACTIVE[kind] = jid
     return jid
+
+
+# ---------------- HÀNG LOẠT (batch): nhiều link, chạy song song ----------------
+BATCH = {}            # id -> item công khai + "_ctx" nội bộ
+BATCH_ORDER = []      # thứ tự hiển thị
+BATCH_QUEUE = queue.Queue()
+_BATCH_WORKERS = False
+BATCH_MAX_LINKS = 20
+BATCH_PARALLEL = 2    # số bài chạy cùng lúc (AI ăn CPU — 2 là vừa máy thường)
+
+
+def _batch_public(item):
+    return {k: item[k] for k in ("id", "url", "title", "status", "progress",
+                                 "label", "error")}
+
+
+def _run_batch_item(item, opts):
+    """Một bài trong hàng loạt: tải YouTube -> nạp -> toàn trình -> video,
+    tất cả trong thư mục riêng của bài đó."""
+    ctx = item["_ctx"]
+
+    def cb(pct, label=""):
+        with LOCK:
+            item["progress"] = round(float(pct), 1)
+            if label:
+                item["label"] = label
+    from karaoke import ytdl
+    fb = media.ffmpeg_bin()
+    ffmpeg_dir = os.path.dirname(os.path.abspath(fb)) \
+        if os.path.sep in fb else None
+    src, yt_title, video_path = ytdl.download(
+        item["url"], ctx["_work"], _scaled(cb, 2, 16),
+        opts["want_video"], ffmpeg_dir)
+    with LOCK:
+        item["title"] = yt_title
+    dur = _load_song_file(ctx, src, yt_title)
+    if dur <= 0:
+        raise ValueError("File tải về không đọc được tiếng — thử link khác")
+    if video_path:
+        ctx["bg_video"] = video_path
+        bg = {"type": "video", "value": video_path}
+    else:
+        bg = resolve_bg(opts["bg"], ctx)
+    run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
+                 opts["style"], yt_title, opts["guide"], bg,
+                 video_url=f"/api/batch/{item['id']}/video")
+
+
+def _batch_worker():
+    while True:
+        item_id, opts = BATCH_QUEUE.get()
+        item = BATCH.get(item_id)
+        if item is None:
+            continue
+        with LOCK:
+            item["status"] = "running"
+        try:
+            _run_batch_item(item, opts)
+            with LOCK:
+                item.update(status="done", progress=100.0, label="Xong")
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            with LOCK:
+                item.update(status="error", error=str(e))
+
+
+def _ensure_batch_workers():
+    global _BATCH_WORKERS
+    with LOCK:
+        if _BATCH_WORKERS:
+            return
+        _BATCH_WORKERS = True
+    for _ in range(BATCH_PARALLEL):
+        threading.Thread(target=_batch_worker, daemon=True).start()
 
 
 def serve_file(handler, path, content_type, download_name=None):
@@ -158,21 +351,7 @@ class Handler(BaseHTTPRequestHandler):
         return json.loads(raw.decode("utf-8")) if raw else {}
 
     def _resolve_bg(self, bg_req):
-        """Chọn nền video từ yêu cầu: ảnh/video người dùng tải lên, mẫu
-        gradient có sẵn (tạo ảnh 1 lần rồi dùng lại), hoặc màu trơn."""
-        bg_req = bg_req or {}
-        t = bg_req.get("type")
-        if t == "image" and STATE["bg_image"]:
-            return {"type": "image", "value": STATE["bg_image"]}
-        if t == "video" and STATE["bg_video"]:
-            return {"type": "video", "value": STATE["bg_video"]}
-        if t == "gradient":
-            kind = str(bg_req.get("value") or "demtim")
-            path = os.path.join(WORK, f"grad_{kind}.png")
-            if not os.path.exists(path):
-                media.make_gradient_bg(kind, path)
-            return {"type": "image", "value": path}
-        return {"type": "color", "value": bg_req.get("value", "#0b0e1a")}
+        return resolve_bg(bg_req, STATE)
 
     # ---------- GET ----------
     def do_GET(self):
@@ -214,6 +393,27 @@ class Handler(BaseHTTPRequestHandler):
             elif path == "/api/download" and STATE["out_mp4"]:
                 serve_file(self, STATE["out_mp4"], "video/mp4",
                            download_name="karaoke.mp4")
+            elif path == "/api/batch":
+                with LOCK:
+                    items = [_batch_public(BATCH[i]) for i in BATCH_ORDER
+                             if i in BATCH]
+                self._json({"items": items})
+            elif path.startswith("/api/batch/"):
+                parts = path.split("/")  # /api/batch/<id>/video|download
+                item = BATCH.get(parts[3]) if len(parts) == 5 else None
+                out = item["_ctx"]["out_mp4"] if item else None
+                if not out or not os.path.exists(out):
+                    return self._json(
+                        {"error": "Bài này chưa có video"}, 404)
+                if parts[4] == "download":
+                    safe = "".join(c for c in (item["title"] or "karaoke")
+                                   if c not in '<>:"/\\|?*').strip()[:80]
+                    serve_file(self, out, "video/mp4",
+                               download_name=(safe or "karaoke") + ".mp4")
+                elif parts[4] == "video":
+                    serve_file(self, out, "video/mp4")
+                else:
+                    self._json({"error": "not found"}, 404)
             else:
                 self._json({"error": "not found"}, 404)
         except BrokenPipeError:
@@ -236,12 +436,8 @@ class Handler(BaseHTTPRequestHandler):
                 src = os.path.join(WORK, "song_src" + ext)
                 with open(src, "wb") as f:
                     f.write(payload)
-                wav = os.path.join(WORK, "song.wav")
-                media.extract_audio(src, wav)
-                STATE.update(song_name=name, song_wav=wav,
-                             duration=media.probe_duration(wav),
-                             inst_wav=None, inst_mode=None, out_mp4=None)
-                self._json({"ok": True, "name": name, "duration": STATE["duration"]})
+                dur = _load_song_file(STATE, src, name)
+                self._json({"ok": True, "name": name, "duration": dur})
 
             elif path in ("/api/upload-bg-image", "/api/upload-bg-video"):
                 payload = self._body()
@@ -411,64 +607,13 @@ class Handler(BaseHTTPRequestHandler):
                     guide = 0.0
                 bg = self._resolve_bg(req.get("bg")
                                       or {"type": "gradient", "value": "demtim"})
-                song_wav, duration = STATE["song_wav"], STATE["duration"]
-                if duration <= 0:
+                if STATE["duration"] <= 0:
                     return self._json(
                         {"error": "Không đọc được thời lượng bài hát"}, 400)
-                models_dir = os.path.join(ROOT, "models")
-                inst_out = os.path.join(WORK, "inst.wav")
-                ass_path = os.path.join(WORK, "lyrics.ass")
-                out_mp4 = os.path.join(WORK, "karaoke.mp4")
 
                 def job(cb):
-                    def scaled(lo, hi):
-                        return lambda p, label="": cb(
-                            lo + (hi - lo) * float(p) / 100.0, label)
-                    cb(1, "Đang tách beat...")
-                    if sep_mode == "fast":
-                        media.center_cut(song_wav, inst_out, scaled(2, 30),
-                                         duration)
-                    else:
-                        mdx.separate_mdx(song_wav, inst_out,
-                                         progress_cb=scaled(2, 30))
-                    STATE.update(inst_wav=inst_out, inst_mode=sep_mode)
-                    from karaoke import align as alg
-                    segs = alg.transcribe_segments(song_wav, duration,
-                                                   scaled(32, 68), models_dir)
-                    cb(70, "Đang gắn mốc giờ từng câu...")
-                    if texts:
-                        heard = [w for s in segs for w in s["words"]]
-                        full = alg.align_full(heard, texts, duration)
-                        raw = [{"text": t, "start": s,
-                                "words": [list(x) for x in ws]}
-                               for t, s, ws in zip(texts, full["starts"],
-                                                   full["words"])]
-                        matched, source = full["ratio"], "user"
-                    else:
-                        raw = alg.segments_to_lines(segs)
-                        matched, source = 1.0, "ai"
-                    if not raw:
-                        raise ValueError(
-                            "Không tạo được lời từ bài này — thử dán lời vào "
-                            "bước 3 rồi bấm Tự căn bằng AI")
-                    timed = lyr.assign_ends(raw, duration)
-                    st = dict(style)
-                    if title:
-                        st["title"] = title
-                    with open(ass_path, "w", encoding="utf-8") as f:
-                        f.write(lyr.build_ass(timed, st))
-                    cb(80, "Đang xuất video...")
-                    audio = inst_out
-                    if guide > 0:
-                        mixed = os.path.join(WORK, "mixed.wav")
-                        media.mix_with_guide(inst_out, song_wav, guide, mixed)
-                        audio = mixed
-                    media.render_video(bg, audio, ass_path, out_mp4, duration,
-                                       scaled(80, 100))
-                    STATE["out_mp4"] = out_mp4
-                    return {"video": "/api/video", "lines": timed,
-                            "matched": matched, "source": source,
-                            "count": len(timed)}
+                    return run_pipeline(cb, STATE, texts, sep_mode, style,
+                                        title, guide, bg)
                 if any_job_running():
                     return self._json(
                         {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
@@ -477,6 +622,118 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json(
                         {"error": "Đang làm video tự động dở — chờ xong đã"}, 409)
                 self._json({"job": jid})
+
+            elif path == "/api/auto-link":
+                # HỆ THỐNG TỰ HÀNH: link YouTube -> tải -> nạp bài -> toàn
+                # trình tự động -> video karaoke hoàn chỉnh, MỘT tác vụ.
+                req = self._body_json()
+                from karaoke import ytdl
+                url = str(req.get("url") or "").strip()
+                try:
+                    ytdl.canonical_url(url)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                want_video = bool(req.get("want_video"))
+                texts = req.get("lyrics")
+                if isinstance(texts, list):
+                    texts = [str(t).strip() for t in texts if str(t).strip()]
+                    if not texts:
+                        texts = None
+                else:
+                    texts = None
+                if texts and len(texts) > 600:
+                    return self._json({"error": "Quá nhiều câu lời"}, 400)
+                sep_mode = "fast" if req.get("sep_mode") == "fast" else "ai"
+                style = req.get("style") or {}
+                title_req = str(req.get("title") or "").strip()
+                try:
+                    guide = float(req.get("guide") or 0)
+                except (TypeError, ValueError):
+                    guide = 0.0
+                fallback_bg = self._resolve_bg(
+                    req.get("bg") or {"type": "gradient", "value": "demtim"})
+                fb = media.ffmpeg_bin()
+                ffmpeg_dir = os.path.dirname(os.path.abspath(fb)) \
+                    if os.path.sep in fb else None
+
+                def job(cb):
+                    src, yt_title, video_path = ytdl.download(
+                        url, WORK, _scaled(cb, 2, 16), want_video, ffmpeg_dir)
+                    dur = _load_song_file(STATE, src, yt_title)
+                    if dur <= 0:
+                        raise ValueError(
+                            "File tải về không đọc được tiếng — thử link khác")
+                    if video_path:
+                        STATE["bg_video"] = video_path
+                    bg = ({"type": "video", "value": video_path}
+                          if video_path else fallback_bg)
+                    return run_pipeline(_scaled(cb, 18, 100), STATE, texts,
+                                        sep_mode, style,
+                                        title_req or yt_title, guide, bg)
+                if any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
+                jid = start_job("autolink", job)
+                if jid is None:
+                    return self._json(
+                        {"error": "Đang chạy tự hành dở — chờ xong đã"}, 409)
+                self._json({"job": jid})
+
+            elif path == "/api/batch":
+                # HÀNG LOẠT: nhiều link YouTube -> mỗi bài một thư mục riêng,
+                # chạy song song (tối đa BATCH_PARALLEL bài), xong bài nào
+                # tải bài đó. Link hỏng thành mục lỗi hiển thị rõ, không nuốt.
+                req = self._body_json()
+                urls = req.get("urls")
+                if not isinstance(urls, list) or not urls:
+                    return self._json(
+                        {"error": "Chưa có link nào — dán ít nhất 1 link "
+                                  "YouTube"}, 400)
+                urls = [str(u).strip() for u in urls if str(u).strip()]
+                if not urls:
+                    return self._json({"error": "Danh sách link rỗng"}, 400)
+                if len(urls) > BATCH_MAX_LINKS:
+                    return self._json(
+                        {"error": f"Tối đa {BATCH_MAX_LINKS} link mỗi đợt — "
+                                   "chia nhỏ ra nhé"}, 400)
+                from karaoke import ytdl
+                sep_mode = "fast" if req.get("sep_mode") == "fast" else "ai"
+                try:
+                    guide = float(req.get("guide") or 0)
+                except (TypeError, ValueError):
+                    guide = 0.0
+                bg_req = req.get("bg") \
+                    or {"type": "gradient", "value": "demtim"}
+                if (bg_req or {}).get("type") not in ("gradient", "color"):
+                    bg_req = {"type": "gradient", "value": "demtim"}
+                opts = {"want_video": bool(req.get("want_video")),
+                        "sep_mode": sep_mode,
+                        "style": req.get("style") or {},
+                        "guide": guide, "bg": bg_req}
+                _ensure_batch_workers()
+                created, first_err = [], None
+                for raw_url in urls:
+                    iid = uuid.uuid4().hex[:10]
+                    item = {"id": iid, "url": raw_url, "title": None,
+                            "status": "queued", "progress": 0.0, "label": "",
+                            "error": None,
+                            "_ctx": new_ctx(os.path.join(ROOT, "batch", iid))}
+                    try:
+                        item["url"] = ytdl.canonical_url(raw_url)
+                    except ValueError as e:
+                        item.update(status="error", error=str(e))
+                        first_err = first_err or str(e)
+                    with LOCK:
+                        BATCH[iid] = item
+                        BATCH_ORDER.append(iid)
+                    created.append(iid)
+                    if item["status"] == "queued":
+                        BATCH_QUEUE.put((iid, opts))
+                if not any(BATCH[i]["status"] == "queued" for i in created):
+                    return self._json(
+                        {"error": first_err or "Không có link nào hợp lệ"},
+                        400)
+                self._json({"items": created})
 
             else:
                 self._json({"error": "not found"}, 404)
@@ -491,9 +748,26 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
-    print(f"Karaoke Maker đang chạy tại {url}")
-    if os.environ.get("KARAOKE_NO_BROWSER") != "1":
-        threading.Timer(0.6, lambda: webbrowser.open(url)).start()
+    print(f"Karaoke Maker đang chạy tại {url}", flush=True)
+    if os.environ.get("KARAOKE_NO_BROWSER") == "1":
+        try:
+            server.serve_forever()
+        except KeyboardInterrupt:
+            pass
+        return
+    # Ưu tiên CỬA SỔ APP RIÊNG trên máy (pywebview/WebView2). Mở không được
+    # vì bất kỳ lý do gì thì lùi về trình duyệt như cũ — vỏ hiển thị không
+    # bao giờ được làm chết app.
+    try:
+        import webview
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        webview.create_window("Karaoke Maker — làm video karaoke", url,
+                              width=1280, height=860, min_size=(960, 640))
+        webview.start()
+        return
+    except Exception:  # noqa: BLE001
+        traceback.print_exc()
+    threading.Timer(0.6, lambda: webbrowser.open(url)).start()
     try:
         server.serve_forever()
     except KeyboardInterrupt:
@@ -501,4 +775,8 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) > 1 and sys.argv[1] == "--whisper-worker":
+        # Chế độ worker Whisper (tiến trình con, xem karaoke/whisper_worker.py)
+        from karaoke.whisper_worker import main as _worker_main
+        sys.exit(_worker_main(sys.argv[2:]))
     main()

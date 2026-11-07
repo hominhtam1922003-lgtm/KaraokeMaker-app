@@ -37,19 +37,39 @@ function pollJob(jobId, progressEl, onDone, onErr) {
   const bar = progressEl.querySelector(".bar");
   const pct = progressEl.querySelector(".pct");
   progressEl.hidden = false;
+  progressEl.classList.remove("err");
   bar.style.width = "0%"; pct.textContent = "0%";
+  let fails = 0;
   const iv = setInterval(async () => {
     try {
       const r = await fetch("/api/job/" + jobId);
       const job = await r.json();
+      fails = 0;
       bar.style.width = job.progress + "%";
       pct.textContent = (job.label ? job.label + " · " : "") + job.progress + "%";
       if (job.status === "done") { clearInterval(iv); onDone && onDone(job.result); }
       else if (job.status === "error") {
-        clearInterval(iv); progressEl.hidden = true;
+        // Lỗi phải HIỆN RÕ và NẰM LẠI trên màn hình — bản cũ chỉ toast thoáng
+        // qua nên người dùng tưởng app "im luôn" không rõ chuyện gì.
+        clearInterval(iv);
+        progressEl.classList.add("err");
+        bar.style.width = "100%";
+        pct.textContent = "✗ " + (job.error || "Lỗi không rõ");
         (onErr || ((e) => toast(e, true)))(job.error || "Lỗi không rõ");
       }
-    } catch (e) { /* mạng chập chờn, thử lại ở nhịp sau */ }
+    } catch (e) {
+      // Không nuốt lặng vô hạn: mất kết nối nhiều nhịp liên tiếp = app nhiều
+      // khả năng đã tắt — nói thẳng để người dùng mở lại thay vì chờ mãi.
+      fails++;
+      if (fails >= 8) {
+        clearInterval(iv);
+        progressEl.classList.add("err");
+        bar.style.width = "100%";
+        pct.textContent = "✗ Mất kết nối với app — app có thể đã bị tắt. "
+          + "Mở lại file KaraokeMaker.exe rồi làm lại bước này.";
+        (onErr || ((e2) => toast(e2, true)))("Mất kết nối với app");
+      }
+    }
   }, 400);
 }
 
@@ -347,6 +367,113 @@ $("bgVideoFile").addEventListener("change", (e) => e.target.files[0] && uploadBg
 $("guide").addEventListener("input", (e) => ($("guideVal").textContent = e.target.value + "%"));
 
 /* ---------- Tự động toàn phần ---------- */
+function handleAutoResult(res, okEl) {
+  state.instReady = true;
+  $("instPlayer").src = bust("/api/audio/inst");
+  $("instInfo").hidden = false;
+  setLines(res.lines, true);
+  $("renderDone").hidden = false;
+  $("outVideo").src = bust("/api/video");
+  unlock("step2"); unlock("step3"); unlock("step4"); unlock("step5"); unlock("step6");
+  if ($("songName")) {
+    $("songInfo").hidden = false;
+  }
+  okEl.textContent = res.source === "ai"
+    ? `Xong! AI tự chép & căn ${res.count} câu. Nghe thử — sai chữ ở đâu thì sửa lời ở bước 3 rồi bấm Tự căn bằng AI để làm lại chuẩn hơn.`
+    : `Xong! Dùng lời bạn dán, AI khớp ${Math.round((res.matched || 0) * 100)}% số từ, ${res.count} câu.`;
+  toast("Video karaoke xong! 🎉");
+}
+let batchTimer = null;
+function escHtml(s) {
+  return String(s ?? "").replace(/[&<>"']/g, (c) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[c]));
+}
+function renderBatch(items) {
+  const box = $("batchList");
+  box.innerHTML = "";
+  for (const it of items) {
+    const div = document.createElement("div");
+    div.className = "batch-item";
+    const name = escHtml(it.title || it.url);
+    let badge, extra = "";
+    if (it.status === "done") {
+      badge = '<span class="badge ok">✓ Xong</span>';
+      extra = `<a class="dl" href="/api/batch/${it.id}/download">⬇ Tải video</a>
+               <a class="dl ghost" href="/api/batch/${it.id}/video" target="_blank">Xem</a>`;
+    } else if (it.status === "error") {
+      badge = '<span class="badge err">✗ Lỗi</span>';
+      extra = `<span class="err-text">${escHtml(it.error || "")}</span>`;
+    } else if (it.status === "running") {
+      badge = `<span class="badge run">Đang chạy ${Math.round(it.progress)}%</span>`;
+      extra = `<span class="run-label">${escHtml(it.label || "")}</span>`;
+    } else {
+      badge = '<span class="badge wait">Chờ lượt</span>';
+    }
+    div.innerHTML = `<div class="batch-head"><span class="batch-name">${name}</span>${badge}</div>
+      <div class="progress batch-bar"><div class="bar" style="width:${it.progress || 0}%"></div></div>
+      <div class="batch-extra">${extra}</div>`;
+    box.appendChild(div);
+  }
+}
+async function pollBatch() {
+  try {
+    const data = await (await fetch("/api/batch")).json();
+    renderBatch(data.items || []);
+    const active = (data.items || []).some(
+      (i) => i.status === "queued" || i.status === "running");
+    if (!active && batchTimer) {
+      clearInterval(batchTimer);
+      batchTimer = null;
+      $("btnAutoLink").disabled = false;
+      toast("Hàng loạt xong hết! 🎉");
+    }
+  } catch (e) { /* server bận — lần poll sau thử lại */ }
+}
+$("btnAutoLink").addEventListener("click", async () => {
+  const urls = $("ytUrls").value.split("\n").map((s) => s.trim()).filter(Boolean);
+  if (!urls.length) return toast("Chưa dán link YouTube.", true);
+  const common = {
+    want_video: $("ytVideoBg").checked,
+    sep_mode: document.querySelector('input[name="sepmode"]:checked').value,
+    style: collectStyle(),
+    guide: Number($("guide").value),
+    bg: currentBg(),
+  };
+  $("btnAutoLink").disabled = true;
+  $("autoLinkOk").textContent = "";
+  if (urls.length > 1) {
+    // HÀNG LOẠT: nhiều link -> chạy song song phía server, poll danh sách.
+    try {
+      await postJSON("/api/batch", { urls, ...common });
+      $("batchBox").hidden = false;
+      await pollBatch();
+      if (batchTimer) clearInterval(batchTimer);
+      batchTimer = setInterval(pollBatch, 2000);
+    } catch (err) {
+      $("btnAutoLink").disabled = false;
+      toast(err.message, true);
+    }
+    return;
+  }
+  try {
+    const { job } = await postJSON("/api/auto-link", {
+      url: urls[0],
+      lyrics: state.lines.length ? state.lines.map((l) => l.text) : null,
+      title: $("songTitle").value.trim(),
+      ...common,
+    });
+    pollJob(job, $("autoLinkProgress"), (res) => {
+      $("btnAutoLink").disabled = false;
+      state.duration = 1; // bài đã nạp phía server; phát lại được qua /api/audio
+      $("songPlayer").src = bust("/api/audio/song");
+      handleAutoResult(res, $("autoLinkOk"));
+    }, (e) => { $("btnAutoLink").disabled = false; toast(e, true); });
+  } catch (err) {
+    $("btnAutoLink").disabled = false;
+    toast(err.message, true);
+  }
+});
 $("btnAutoAll").addEventListener("click", async () => {
   if (!state.duration) return toast("Chưa có bài hát — làm bước 1 trước.", true);
   $("btnAutoAll").disabled = true;
@@ -363,17 +490,7 @@ $("btnAutoAll").addEventListener("click", async () => {
     });
     pollJob(job, $("autoProgress"), (res) => {
       $("btnAutoAll").disabled = false;
-      state.instReady = true;
-      $("instPlayer").src = bust("/api/audio/inst");
-      $("instInfo").hidden = false;
-      setLines(res.lines, true);
-      $("renderDone").hidden = false;
-      $("outVideo").src = bust("/api/video");
-      unlock("step5"); unlock("step6");
-      $("autoOk").textContent = res.source === "ai"
-        ? `Xong! AI tự chép & căn ${res.count} câu. Nghe thử — sai chữ ở đâu thì sửa lời ở bước 3 rồi bấm Tự căn bằng AI để làm lại chuẩn hơn.`
-        : `Xong! Dùng lời bạn dán, AI khớp ${Math.round((res.matched || 0) * 100)}% số từ, ${res.count} câu.`;
-      toast("Video karaoke tự động xong! 🎉");
+      handleAutoResult(res, $("autoOk"));
     }, (e) => { $("btnAutoAll").disabled = false; toast(e, true); });
   } catch (err) {
     $("btnAutoAll").disabled = false;

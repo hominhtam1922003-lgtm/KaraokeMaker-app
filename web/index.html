@@ -13,6 +13,23 @@
 </header>
 
 <main>
+  <!-- HỆ THỐNG TỰ HÀNH -->
+  <section class="card" id="stepAutoLink">
+    <h2><span class="num">🤖</span> Hệ thống tự hành — dán link là có video</h2>
+    <p class="hint">Dán link YouTube (video, Shorts, Music đều được) → app tự tải về, tự tách beat, tự chép lời &amp; căn nhịp theo từng từ, tự ghép chữ theo mẫu đã chọn ở bước 5 → ra video karaoke hoàn chỉnh. <b>Dán nhiều link (mỗi dòng 1 link)</b> thì app chạy hàng loạt song song, xong bài nào tải bài đó.</p>
+    <textarea id="ytUrls" rows="3" placeholder="https://www.youtube.com/watch?v=...&#10;(dán nhiều link: mỗi dòng 1 link, tối đa 20)"></textarea>
+    <label class="chk"><input type="checkbox" id="ytVideoBg"> Tải cả video gốc làm nền (đẹp hơn, nhưng tải lâu hơn)</label>
+    <div class="row">
+      <button class="primary big" id="btnAutoLink">🤖 Chạy tự hành: link → video karaoke</button>
+    </div>
+    <div class="progress" id="autoLinkProgress" hidden><div class="bar"></div><span class="pct">0%</span></div>
+    <div class="ok" id="autoLinkOk"></div>
+    <div id="batchBox" hidden>
+      <h3>📦 Hàng loạt — đang chạy tự động</h3>
+      <div id="batchList"></div>
+    </div>
+  </section>
+
   <!-- BƯỚC 1 -->
   <section class="card" id="step1">
     <h2><span class="num">1</span> Bài hát</h2>

@@ -13,8 +13,13 @@ giờ từng từ là giờ thật, khỏi cần đối chiếu.
 Model tải về máy ở lần dùng đầu tiên và dùng lại mãi về sau (thư mục models
 cạnh dữ liệu app).
 """
+import json
 import os
 import re
+import subprocess
+import sys
+import threading
+import time
 import unicodedata
 from difflib import SequenceMatcher
 
@@ -192,10 +197,118 @@ def _load_model(models_dir):
             + str(e)) from e
 
 
+def load_model_only(models_dir):
+    """Nạp model một lần chỉ để chắc chắn nó đã tải xong về máy (dùng khi
+    nhiều tác vụ song song cần tránh tải trùng nhau). Chạy ở worker con —
+    nạp model không bao giờ được phép kéo sập app chính."""
+    if os.environ.get("KARAOKE_WHISPER_INPROCESS") == "1":
+        _load_model(models_dir)
+        return
+    try:
+        _run_worker(["load-only", str(models_dir or "")], None)
+    except _WorkerSpawnError:
+        _load_model(models_dir)
+
+
+class _WorkerSpawnError(RuntimeError):
+    """Không khởi động được tiến trình con — nơi gọi sẽ lùi về chạy trong
+    tiến trình chính (thà chạy chung còn hơn không chạy được)."""
+
+
+def _worker_cmd():
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "--whisper-worker"]
+    return [sys.executable,
+            os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                         "whisper_worker.py")]
+
+
+def _run_worker(args, progress_cb):
+    """Chạy worker Whisper ở tiến trình con, chuyển tiếp tiến độ, trả kết
+    quả. Worker sập (kể cả segfault native) -> RuntimeError rõ ràng, app
+    chính vẫn sống."""
+    cb = progress_cb or (lambda pct, label="": None)
+    try:
+        proc = subprocess.Popen(
+            _worker_cmd() + args, stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace")
+    except Exception as e:  # noqa: BLE001
+        raise _WorkerSpawnError(
+            "Không khởi động được AI nghe lời: " + str(e)) from e
+    err_tail = []
+
+    def drain_err():
+        try:
+            for line in proc.stderr:
+                err_tail.append(line.rstrip())
+                del err_tail[:-20]
+        except Exception:  # noqa: BLE001
+            pass
+
+    threading.Thread(target=drain_err, daemon=True).start()
+    state = {"last": time.time(), "result": None, "error": None}
+
+    def watchdog():
+        # Worker câm lặng quá 30 phút (mạng treo khi tải model...) thì giết,
+        # tránh chiếm chỗ chạy mãi mãi.
+        while proc.poll() is None:
+            if time.time() - state["last"] > 1800:
+                proc.kill()
+                return
+            time.sleep(10)
+
+    threading.Thread(target=watchdog, daemon=True).start()
+    for line in proc.stdout:
+        state["last"] = time.time()
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            msg = json.loads(line)
+        except ValueError:
+            continue
+        if "result" in msg:
+            state["result"] = msg["result"]
+        elif "error" in msg:
+            state["error"] = msg["error"]
+        elif "pct" in msg:
+            cb(float(msg["pct"]), msg.get("label", ""))
+    proc.wait()
+    if state["error"]:
+        raise RuntimeError(state["error"])
+    if state["result"] is None:
+        tail = "\n".join(err_tail[-5:])
+        raise RuntimeError(
+            "AI nghe lời bị sập giữa chừng (mã lỗi "
+            f"{proc.returncode}) — app vẫn chạy bình thường, thử bấm lại. "
+            "Chi tiết: " + (tail or "không có thêm thông tin"))
+    return state["result"]
+
+
 def transcribe_segments(wav_path, duration=0.0, progress_cb=None,
                         models_dir=None):
-    """Chép lời bài hát bằng Whisper. Trả về các đoạn:
-    [{'text','start','end','words':[{'w','start','end'}]}]."""
+    """Chép lời bài hát bằng Whisper (ở TIẾN TRÌNH CON — xem whisper_worker).
+    Trả về các đoạn: [{'text','start','end','words':[{'w','start','end'}]}]."""
+    cb = progress_cb or (lambda pct, label="": None)
+    if os.environ.get("KARAOKE_WHISPER_INPROCESS") == "1":
+        return _transcribe_inprocess(wav_path, duration, cb, models_dir)
+    try:
+        segments = _run_worker(
+            ["segments", str(wav_path), str(models_dir or ""),
+             str(float(duration or 0))], cb)
+    except _WorkerSpawnError:
+        return _transcribe_inprocess(wav_path, duration, cb, models_dir)
+    if not segments:
+        raise ValueError(
+            "AI không nghe rõ lời nào trong bài này — thử căn tay bằng Space")
+    return segments
+
+
+def _transcribe_inprocess(wav_path, duration=0.0, progress_cb=None,
+                          models_dir=None):
+    """Đường dự phòng: chép lời ngay trong tiến trình chính (chỉ khi không
+    khởi động được worker con, hoặc khi biến KARAOKE_WHISPER_INPROCESS=1)."""
     cb = progress_cb or (lambda pct, label="": None)
     cb(3, "Đang nạp model AI nghe lời — lần đầu dùng sẽ tải khoảng 470 MB, "
           "các lần sau dùng lại luôn")

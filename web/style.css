@@ -89,3 +89,21 @@ select, input[type="text"] {
 }
 .grad.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
 #stepAuto { border-color: var(--accent2); }
+
+/* Hàng loạt */
+#batchBox { margin-top: 18px; border-top: 1px dashed var(--line); padding-top: 12px; }
+.batch-item { background: var(--card2); border: 1px solid var(--line); border-radius: 12px; padding: 10px 12px; margin-bottom: 10px; }
+.batch-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; margin-bottom: 6px; }
+.batch-name { font-weight: 600; font-size: 14px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.badge { font-size: 12px; font-weight: 700; padding: 3px 9px; border-radius: 999px; white-space: nowrap; }
+.badge.ok { background: #14532d; color: #86efac; }
+.badge.err { background: #5b1a1a; color: #fca5a5; }
+.badge.run { background: #1e3a5f; color: #93c5fd; }
+.badge.wait { background: #3f3f46; color: #d4d4d8; }
+.batch-bar { margin: 4px 0; }
+.batch-extra { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; font-size: 13px; }
+.batch-extra .dl { color: var(--accent); font-weight: 700; text-decoration: none; }
+.batch-extra .dl.ghost { color: var(--text); opacity: .75; font-weight: 400; }
+.batch-extra .err-text { color: #fca5a5; }
+.progress.err .bar { background: #e5484d; }
+.progress.err .pct { color: #ffb4b4; font-size: 12px; }
