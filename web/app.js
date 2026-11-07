@@ -9,6 +9,7 @@ const state = {
   color: "#FFD400", baseColor: "#FFFFFF", outlineW: 3,
   gradKind: "demtim", ratio: "16:9", sepMode: "ai",
   projects: [], storage: null, saveTimer: null, saveDirty: false,
+  bgRev: 0, // tăng mỗi lần file nền hiện tại có thể đã đổi (tải lên/mở project)
 };
 const audio = () => $("studioAudio");
 
@@ -70,7 +71,15 @@ function pollJob(jobId, progressEl, onDone, onErr) {
       fails = 0;
       bar.style.width = job.progress + "%";
       pct.textContent = (job.label ? job.label + " · " : "") + job.progress + "%";
-      if (job.status === "done") { clearInterval(iv); onDone && onDone(job.result); }
+      if (job.status === "done") {
+        clearInterval(iv);
+        // Cảnh báo trong kết quả (vd lời đang dùng là BẢN NHÁP tự chép)
+        // phải nổi lên ngay — không để user tưởng đó là kết quả chuẩn.
+        if (job.result && job.result.warning) {
+          toast("⚠ " + job.result.warning, true);
+        }
+        onDone && onDone(job.result);
+      }
       else if (job.status === "error") {
         // Lỗi phải HIỆN RÕ và NẰM LẠI — toast thoáng qua làm người dùng
         // tưởng app "im luôn" không rõ chuyện gì.
@@ -281,6 +290,7 @@ function currentBg() {
 }
 function applyStyleToControls(style, bg, guide) {
   style = style || {}; bg = bg || {};
+  state.bgRev++; // project/mẫu khác -> file nền hiện tại có thể đã khác
   if (style.color) state.color = style.color;
   if (style.base_color) state.baseColor = style.base_color;
   if (style.outline_w) state.outlineW = style.outline_w;
@@ -812,8 +822,11 @@ function renderLineList() {
     box.appendChild(row);
   });
   const total = state.lines.length;
-  $("lineStats").textContent = total
-    ? `${total} dòng · ${okN} đã khớp${badN ? ` · ${badN} chưa` : ""}` : "";
+  const ls = $("lineStats");
+  ls.className = badN ? "warn" : "mut";
+  ls.textContent = !total ? ""
+    : badN ? `${total} dòng · ⚠ ${badN} câu CHƯA KHỚP — nghe thử & sửa trước khi xuất`
+    : `${total} dòng · ${okN} đã khớp`;
   syncVoiceChips();
 }
 function editLineText(i, spanEl) {
@@ -958,31 +971,46 @@ $("btnSeparate").addEventListener("click", async () => {
     toast(err.message, true);
   }
 });
-$("btnAutoAll").addEventListener("click", async () => {
-  if (!state.projectId) return toast("Chưa mở project nào.", true);
-  if (!state.hasSong) return toast("Project chưa có bài hát.", true);
-  $("btnAutoAll").disabled = true;
+async function runAutoAll(lyricsOrNull, btn) {
+  btn.disabled = true;
   try {
     const { job } = await postJSON("/api/auto-all", {
-      lyrics: state.lines.length ? state.lines.map((l) => l.text) : null,
+      lyrics: lyricsOrNull,
       sep_mode: sepMode(), style: styleForRender(),
       title: $("songTitle").value.trim(),
       guide: Number($("guide").value), bg: currentBg(),
     });
     pollJob(job, $("studioProgress"), (res) => {
-      $("btnAutoAll").disabled = false;
+      btn.disabled = false;
       state.instReady = true;
       $("dlBeat").hidden = false;
       setLines(res.lines, true);
-      $("studioOk").textContent = res.source === "ai"
-        ? `Xong trọn gói! AI tự chép & căn ${res.count} câu, video đã xuất — sang màn Xuất để xuất lại theo preset, hoặc mở Thư viện xem bài.`
-        : `Xong trọn gói! Khớp ${Math.round((res.matched || 0) * 100)}% số từ, ${res.count} câu.`;
+      $("studioOk").textContent = res.warning
+        ? "⚠ " + res.warning
+        : `Xong trọn gói! Khớp ${Math.round((res.matched || 0) * 100)}% số từ, ${res.count} câu — video đã xuất, sang màn Xuất để xuất lại theo preset hoặc mở Thư viện xem bài.`;
       toast("Làm tự động trọn gói xong! 🎉");
-    }, (e) => { $("btnAutoAll").disabled = false; toast(e, true); });
+    }, (e) => { btn.disabled = false; toast(e, true); });
   } catch (err) {
-    $("btnAutoAll").disabled = false;
+    btn.disabled = false;
     toast(err.message, true);
   }
+}
+$("btnAutoAll").addEventListener("click", () => {
+  if (!state.projectId) return toast("Chưa mở project nào.", true);
+  if (!state.hasSong) return toast("Project chưa có bài hát.", true);
+  // Đường CHUẨN (user chốt): trọn gói chỉ chạy theo lời ĐÃ DÁN. Trống lời
+  // thì chỉ đường xuống nút "AI tự chép lời" (bản nháp) ở dưới.
+  if (!state.lines.length) {
+    return toast("Chưa có lời — dán lời vào ô trên rồi bấm 'Dùng lời này'. " +
+      "Không có lời thì dùng nút 'AI tự chép lời' (bản nháp) ở dưới.", true);
+  }
+  runAutoAll(state.lines.map((l) => l.text), $("btnAutoAll"));
+});
+$("btnDraftAll").addEventListener("click", () => {
+  if (!state.projectId) return toast("Chưa mở project nào.", true);
+  if (!state.hasSong) return toast("Project chưa có bài hát.", true);
+  toast("Đang chép BẢN NHÁP bằng AI — nghe hát hay sai chữ. Có lời chuẩn thì dán lời rồi Tự căn nhịp bằng AI.", true);
+  runAutoAll(null, $("btnDraftAll"));
 });
 
 /* ----- phát thử + gắn nhịp tay ----- */
@@ -999,8 +1027,15 @@ $("btnPlay").addEventListener("click", async () => {
   else a.pause();
 });
 $("btnListen").addEventListener("click", () => $("btnPlay").click());
-audio().addEventListener("play", () => ($("btnPlay").textContent = "⏸"));
-audio().addEventListener("pause", () => ($("btnPlay").textContent = "▶"));
+audio().addEventListener("play", () => {
+  $("btnPlay").textContent = "⏸";
+  pvSyncVideo(audio().currentTime || 0);
+});
+audio().addEventListener("pause", () => {
+  $("btnPlay").textContent = "▶";
+  const v = $("pvBgVideo");
+  if (v && !v.paused) v.pause();
+});
 audio().addEventListener("timeupdate", () => {
   const a = audio();
   $("transportTime").textContent = `${fmt(a.currentTime)} / ${fmt(state.duration)}`;
@@ -1106,6 +1141,44 @@ document.addEventListener("keydown", (e) => {
 /* ----- xem trước trực tiếp ----- */
 const PV_WORDS = ["Ngày", "mai", "em", "đi", "biển", "nhớ", "tên", "em", "gọi", "về"];
 const PV_NEXT = "Sóng hát lời ca ru êm đềm chiều nay";
+let pvBgKey = "";  // "loại|bgRev" của file nền đang nạp trong hộp xem trước
+let pvBgMsg = "";  // thông báo lỗi xem trước nền (rỗng = bình thường)
+function pvShowMedia(kind) {
+  const vid = $("pvBgVideo"), img = $("pvBgImage");
+  if (!vid || !img) return;
+  if (kind !== "video" && !vid.paused) vid.pause();
+  vid.hidden = kind !== "video";
+  img.hidden = kind !== "image";
+  if (!kind) pvBgKey = "";
+}
+function pvSyncVideo(t) {
+  const vid = $("pvBgVideo");
+  const a = audio();
+  if (!vid || vid.hidden || pvBgMsg) return;
+  if (a && !a.paused) {
+    if (vid.paused) { const p = vid.play(); if (p && p.catch) p.catch(() => {}); }
+    const d = vid.duration;
+    if (d && isFinite(d)) {
+      const target = t % d;
+      if (Math.abs(vid.currentTime - target) > 0.6) {
+        try { vid.currentTime = target; } catch (e) { /* chưa sẵn sàng */ }
+      }
+    }
+  } else if (!vid.paused) vid.pause();
+}
+function pvBgFailed(kind) {
+  if (currentBg().type !== kind || !pvBgKey.startsWith(kind)) return;
+  const url = "/api/bg-preview?kind=" + kind + "&v=" + state.bgRev;
+  const msgBad = "Không xem trước được nền này — bản xuất ra vẫn dùng đúng file";
+  // Phân biệt: chưa có file (404) vs định dạng trình duyệt không đọc được
+  fetch(url, { headers: { Range: "bytes=0-0" } }).then((r) => {
+    pvBgMsg = r.status === 404
+      ? (kind === "video" ? "Chưa có file video nền — hãy bấm “Tải video nền” ở panel Phong cách"
+                          : "Chưa có file ảnh nền — hãy bấm “Tải ảnh nền” ở panel Phong cách")
+      : msgBad;
+    updatePreview();
+  }).catch(() => { pvBgMsg = msgBad; updatePreview(); });
+}
 function updatePreview() { pvRender(audio() ? audio().currentTime || 0 : 0); }
 function pvRender(t) {
   const box = $("pvBox");
@@ -1119,17 +1192,47 @@ function pvRender(t) {
   box.style.margin = "0 auto";
   const bg = currentBg();
   if (bg.type === "gradient" || bg.type === "gradient_anim") {
+    pvShowMedia(null);
     box.style.background = gradCss(state.gradKind);
     box.style.filter = "";
     $("pvTag").textContent = bg.type === "gradient_anim" ? "Nền động" : "";
   } else if (bg.type === "color") {
+    pvShowMedia(null);
     box.style.background = "#0b0e1a"; box.style.filter = "";
     $("pvTag").textContent = "";
   } else {
-    box.style.background = "#232a45";
-    box.style.filter = Number($("bgBlur").value) > 0
-      ? `blur(${Math.round(Number($("bgBlur").value) / 12)}px)` : "";
-    $("pvTag").textContent = bg.type === "image" ? "Nền: ảnh của bạn" : "Nền: video của bạn";
+    // Ảnh/video của user: phát ĐÚNG file mà khâu xuất sẽ dùng
+    // (/api/bg-preview) làm lớp dưới cùng của hộp xem trước. Lỗi nạp
+    // (chưa có file / định dạng lạ) -> báo rõ trên nhãn, không im lặng.
+    const vid = $("pvBgVideo"), img = $("pvBgImage");
+    box.style.background = "#0b0e1a";
+    box.style.filter = "";
+    const kind = bg.type;
+    const key = kind + "|" + state.bgRev;
+    if (pvBgKey !== key) {
+      pvBgKey = key; pvBgMsg = "";
+      const url = "/api/bg-preview?kind=" + kind + "&v=" + state.bgRev;
+      if (kind === "video") {
+        img.hidden = true; img.removeAttribute("src");
+        vid.src = url;
+      } else {
+        if (!vid.paused) vid.pause();
+        vid.removeAttribute("src"); vid.load();
+        img.src = url;
+      }
+    }
+    if (pvBgMsg) {
+      vid.hidden = true; img.hidden = true;
+      $("pvTag").textContent = pvBgMsg;
+    } else {
+      vid.hidden = kind !== "video";
+      img.hidden = kind !== "image";
+      const el = kind === "video" ? vid : img;
+      el.style.filter = Number($("bgBlur").value) > 0
+        ? `blur(${Math.round(Number($("bgBlur").value) / 12)}px)` : "";
+      $("pvTag").textContent = kind === "image" ? "Nền: ảnh của bạn" : "Nền: video của bạn";
+      if (kind === "video") pvSyncVideo(t);
+    }
   }
   if (bg.type === "gradient" || bg.type === "gradient_anim") {
     const bl = Number($("bgBlur").value);
@@ -1211,8 +1314,11 @@ async function uploadBg(file, kind) {
     { "X-File-Name": encodeURIComponent(file.name) });
   $("bgOk").textContent = "Đã tải " + (kind === "image" ? "ảnh" : "video") + " nền: " + data.name;
   $("bgTypeSel").value = kind;
+  state.bgRev++;
   updatePreview(); scheduleSave();
 }
+$("pvBgVideo").addEventListener("error", () => pvBgFailed("video"));
+$("pvBgImage").addEventListener("error", () => pvBgFailed("image"));
 $("bgImageFile").addEventListener("change", (e) => e.target.files[0] && uploadBg(e.target.files[0], "image").catch((err) => toast(err.message, true)));
 $("bgVideoFile").addEventListener("change", (e) => e.target.files[0] && uploadBg(e.target.files[0], "video").catch((err) => toast(err.message, true)));
 

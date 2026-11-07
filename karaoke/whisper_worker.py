@@ -107,8 +107,14 @@ def _segments(src, models_dir, duration, cpu_threads=0, word_ts=True,
         # condition_on_previous_text=False: bài hát có đoạn nhạc dài không
         # lời — để mặc định True khiến model dễ lặp chữ/đuôi suy luận rất
         # lâu trên đoạn nhạc (trông như treo). Tắt là chuẩn cho nhạc.
+        # language="vi" BẮT BUỘC: không truyền thì Whisper tự nhận diện
+        # ngôn ngữ từ 30 giây đầu — hát tiếng Việt rất hay bị nhận nhầm
+        # sang tiếng Anh/ngôn ngữ khác, chữ chép ra vô nghĩa cả bài (sự cố
+        # máy thật 07/11/2026: "Okey don't idols" lẫn trong lời). Tool này
+        # chỉ làm lời tiếng Việt nên khoá cứng, mồi chỉ là phụ trợ.
         segs, _info = model.transcribe(
-            source, word_timestamps=word_ts, beam_size=1, vad_filter=False,
+            source, language="vi",
+            word_timestamps=word_ts, beam_size=1, vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt="Sau đây là lời một bài hát tiếng Việt, được hát "
                            "rõ ràng và viết có dấu đầy đủ.")

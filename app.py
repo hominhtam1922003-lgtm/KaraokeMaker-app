@@ -19,7 +19,7 @@ import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-VERSION = "4.0.0"
+VERSION = "4.1.0"
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
@@ -186,6 +186,252 @@ def resolve_bg(bg_req, ctx, size=(1920, 1080)):
     return {"type": "color", "value": bg_req.get("value", "#0b0e1a")}
 
 
+def _require_bg_resolved(bg_req, resolved):
+    """Nền ảnh/video user ĐÃ CHỌN mà không tìm thấy file thì lỗi rõ ràng —
+    tuyệt đối không lặng lẽ rơi về nền màu tối khi xuất (job/hàng đợi báo
+    lỗi, người dùng tải lại file nền là xong)."""
+    t = (bg_req or {}).get("type")
+    if t in ("image", "video") and resolved.get("type") != t:
+        raise ValueError(
+            "Chưa tìm thấy file nền " +
+            ("ảnh" if t == "image" else "video") +
+            " đã chọn — mở Studio, tải lại file nền rồi thử lại")
+
+
+# Xem trước nền: WebView2/Chromium chỉ phát được các codec/container này.
+_WEB_VIDEO_CODECS = {"h264", "vp8", "vp9", "av1"}
+_WEB_VIDEO_EXTS = {".mp4", ".m4v", ".webm", ".mov"}
+_BG_VIDEO_CTYPES = {".mp4": "video/mp4", ".m4v": "video/mp4",
+                     ".webm": "video/webm", ".mov": "video/quicktime"}
+_BG_IMAGE_CTYPES = {".png": "image/png", ".jpg": "image/jpeg",
+                    ".jpeg": "image/jpeg", ".webp": "image/webp",
+                    ".gif": "image/gif", ".bmp": "image/bmp"}
+_BG_PREVIEW_LOCK = threading.Lock()
+
+
+def _video_codec(path):
+    """codec_name của stream video đầu tiên; '' nếu không đọc được."""
+    try:
+        cmd = [media.ffprobe_bin(), "-v", "error", "-select_streams", "v:0",
+               "-show_entries", "stream=codec_name", "-of", "csv=p=0", path]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                           **media.no_window_kwargs())
+        lines = (r.stdout or "").strip().splitlines()
+        return lines[0].strip() if lines else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _bg_preview_file(src):
+    """File PHỤC VỤ XEM TRƯỚC cho video nền: trả thẳng file gốc nếu
+    WebView2 phát được; định dạng lạ (HEVC, mpeg4, mkv...) thì chuyển mã
+    một bản H.264 nhẹ đặt cạnh file gốc (cache theo mtime+size của gốc).
+    Bản XUẤT luôn dùng file gốc qua ffmpeg — bản này chỉ để xem trước.
+    Trả None nếu chuyển mã cũng hỏng (server sẽ phát gốc, client báo rõ).
+    """
+    ext = os.path.splitext(src)[1].lower()
+    if ext in _WEB_VIDEO_EXTS and _video_codec(src) in _WEB_VIDEO_CODECS:
+        return src
+    workdir = os.path.dirname(src)
+    dst = os.path.join(workdir, "bg_preview.mp4")
+    stamp = os.path.join(workdir, "bg_preview.src")
+    try:
+        key = f"{os.path.getmtime(src)}:{os.path.getsize(src)}"
+    except OSError:
+        return None
+    with _BG_PREVIEW_LOCK:
+        try:
+            with open(stamp, encoding="utf-8") as f:
+                if f.read().strip() == key and os.path.exists(dst):
+                    return dst
+        except Exception:  # noqa: BLE001
+            pass
+        tmp = dst + ".tmp.mp4"
+        cmd = [media.ffmpeg_bin(), "-y", "-v", "error", "-i", src,
+               "-an", "-vf", "scale=min(960\\,iw):-2",
+               "-c:v", "libx264", "-preset", "veryfast", "-crf", "30",
+               "-pix_fmt", "yuv420p", "-movflags", "+faststart", tmp]
+        r = subprocess.run(cmd, capture_output=True, timeout=600,
+                           **media.no_window_kwargs())
+        if r.returncode != 0 or not os.path.exists(tmp):
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+            return None
+        os.replace(tmp, dst)
+        try:
+            with open(stamp, "w", encoding="utf-8") as f:
+                f.write(key)
+        except Exception:  # noqa: BLE001
+            pass
+        return dst
+
+
+def _drop_bg_preview(workdir):
+    """Xoá cache xem trước (khi user đổi video nền khác)."""
+    for name in ("bg_preview.mp4", "bg_preview.src"):
+        try:
+            os.remove(os.path.join(workdir, name))
+        except OSError:
+            pass
+
+
+def _ass_dialogue_count(ass_text):
+    """Số sự kiện Dialogue trong bản ASS — 0 nghĩa là video sẽ TRƠN chữ."""
+    return (ass_text or "").count("Dialogue:")
+
+
+def _require_ass_events(ass_text, burn=True):
+    """Đốt chữ mà bản ASS không có câu nào = chắc chắn ra video trơn.
+    Chặn ngay tại chỗ — không để khâu render 'thành công giả'."""
+    if burn and _ass_dialogue_count(ass_text) <= 0:
+        raise ValueError(
+            "Bản chữ karaoke không có câu nào để đốt — kiểm tra lại lời "
+            "và mốc giờ rồi thử lại (không xuất video trơn)")
+
+
+def _frame_rgb(mp4, at_sec, width=480):
+    """Giải mã 1 khung của MP4 thành mảng RGB (numpy) — phục vụ cổng kiểm
+    sau xuất. None nếu không giải mã được."""
+    import numpy as np
+    cmd = [media.ffmpeg_bin(), "-v", "error",
+           "-ss", f"{max(0.0, at_sec):.2f}", "-i", mp4,
+           "-frames:v", "1", "-vf", f"scale={width}:-2",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    r = subprocess.run(cmd, capture_output=True, timeout=120,
+                       **media.no_window_kwargs())
+    if r.returncode != 0 or not r.stdout or len(r.stdout) % (width * 3):
+        return None
+    h = len(r.stdout) // (width * 3)
+    if h <= 0:
+        return None
+    return np.frombuffer(r.stdout, dtype=np.uint8).reshape(h, width, 3)
+
+
+def _hex_rgb(value):
+    s = str(value or "").lstrip("#")
+    if len(s) != 6:
+        return None
+    try:
+        return tuple(int(s[i:i + 2], 16) for i in (0, 2, 4))
+    except ValueError:
+        return None
+
+
+def verify_export_text(mp4, timed, style):
+    """CỔNG KIỂM SAU XUẤT (mọi đường xuất có đốt chữ đều qua): trích khung
+    ở giữa câu đầu/giữa/cuối từ chính file MP4 vừa xuất, đếm pixel mang
+    màu chữ của style (đã hát / chưa hát / song ca) hoặc gần trắng trong
+    dải chữ nửa dưới khung. Không khung nào đạt ngưỡng -> video coi như
+    KHÔNG có chữ: ném lỗi để job báo lỗi thay vì báo 'xong' oan (sự cố
+    máy thật 07/11/2026: xuất 'xong' mà video trơn chữ + sai nền)."""
+    import numpy as np
+    lines = [ln for ln in (timed or [])
+             if ln.get("start") is not None and (ln.get("text") or "").strip()]
+    if not lines:
+        raise RuntimeError(
+            "Không có câu lời nào có mốc giờ để kiểm tra video đầu ra")
+    colors = []
+    for key in ("color", "base_color", "duet_color",
+                "duet_female_color", "duet_male_color"):
+        rgb = _hex_rgb((style or {}).get(key))
+        if rgb and rgb not in colors:
+            colors.append(rgb)
+    picks = []
+    for idx in sorted({0, len(lines) // 2, len(lines) - 1}):
+        ln = lines[idx]
+        s = float(ln["start"])
+        e = float(ln.get("end") or s + 2.0)
+        # Hai thời điểm trong câu (45% và 75%): tránh mốc rơi vào hiệu
+        # ứng mờ dần ở đầu/cuối câu.
+        picks.append(s + 0.45 * max(0.4, e - s))
+        picks.append(s + 0.75 * max(0.4, e - s))
+    checked = 0
+    for at in picks:
+        frame = _frame_rgb(mp4, at)
+        if frame is None:
+            continue
+        checked += 1
+        h = frame.shape[0]
+        band = frame[int(h * 0.5):, :, :].astype(int)
+        total = band.shape[0] * band.shape[1]
+        hit = np.zeros(band.shape[:2], dtype=bool)
+        for rgb in colors:
+            hit |= (np.abs(band - np.array(rgb)).max(axis=2) <= 42)
+        mx = band.max(axis=2)
+        mn = band.min(axis=2)
+        hit |= (mn >= 195) & ((mx - mn) <= 45)
+        # Ngưỡng THẤP có chủ đích: câu ngắn (vài chữ) trên khung lớn chỉ
+        # cho ~100 pixel chữ ở khung mẫu 480px (đo thật ca H2: 98–115px,
+        # trong khi video trơn trên nền phẳng cho ~0px). Cổng này là
+        # lưới thứ hai sau cổng đếm sự kiện ASS — bắt thảm hoạ "đốt mà
+        # không ra chữ", không thay thế kiểm bằng mắt.
+        if int(hit.sum()) >= max(30, int(total * 0.0008)):
+            return
+    if checked == 0:
+        raise RuntimeError(
+            "Không trích được khung hình nào từ video vừa xuất để kiểm "
+            "tra chữ — coi như chưa đạt, thử xuất lại")
+    raise RuntimeError(
+        "Video xuất ra KHÔNG thấy chữ karaoke ở các mốc có câu hát — "
+        "khâu đốt chữ có thể đã hỏng. Đã chặn, không báo 'xong' oan; "
+        "thử xuất lại hoặc kiểm tra lại lời/mốc giờ")
+
+
+def _vocal_rms(wav_path, t0, t1):
+    """RMS tín hiệu trong [t0, t1) đo trên PCM 16k mono của file WAV.
+    None = không đo được (miễn kiểm — không chặn oan)."""
+    try:
+        import numpy as np
+        pcm = str(wav_path) + ".gate.pcm"
+        media.decode_pcm16k(str(wav_path), pcm)
+        try:
+            a = np.fromfile(pcm, dtype=np.float32)
+        finally:
+            try:
+                os.remove(pcm)
+            except OSError:
+                pass
+        if a.size == 0:
+            return None
+        sr = 16000
+        seg = a[int(max(0.0, t0) * sr):int(max(0.0, t1) * sr)]
+        if seg.size == 0:
+            return None
+        return float(np.sqrt(np.mean(seg.astype(np.float64) ** 2)))
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _check_lyric_lines(lines, duration, vocal_wav=None):
+    """TỰ KIỂM lời sau khi căn giờ, TRƯỚC khi xuất (đường AI tự chép):
+    - mốc giờ phải nằm trong thời lượng bài;
+    - câu đầu bắt đầu quá trễ (>25% bài) MÀ stem giọng đo được tiếng hát
+      rõ trong 25% đầu -> AI đã bỏ sót phần đầu: lỗi rõ ràng, không xuất
+      lặng lẽ ra video thiếu lời nửa bài (sự cố máy thật 07/11/2026)."""
+    if not lines or not duration or duration <= 0:
+        return
+    starts = [float(ln["start"]) for ln in lines
+              if ln.get("start") is not None]
+    if not starts:
+        raise ValueError("Không câu nào có mốc giờ — không xuất được")
+    if min(starts) < -0.01 or max(starts) > duration + 1.0:
+        raise ValueError(
+            "Mốc giờ lời nằm ngoài thời lượng bài — căn giờ đã hỏng, "
+            "thử Tự căn lại hoặc căn tay bằng Space")
+    first = min(starts)
+    if duration >= 40 and first > duration * 0.25 and vocal_wav:
+        rms = _vocal_rms(vocal_wav, 0.0, duration * 0.25)
+        if rms is not None and rms >= 0.015:
+            raise ValueError(
+                f"AI không chép được lời ở phần đầu bài (câu đầu tiên "
+                f"chỉ bắt đầu ở {int(first // 60)}:{int(first % 60):02d}) "
+                "dù đoạn đầu có tiếng hát — xuất ra sẽ thiếu lời nửa "
+                "bài. Đường chuẩn: dán lời bài hát rồi bấm 'Tự căn nhịp "
+                "bằng AI', hoặc gắn nhịp tay bằng Space")
+
+
 def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
                  video_url="/api/video"):
     """TOÀN TRÌNH TỰ HÀNH trên bài hát đã nạp trong ctx: tách beat -> nghe &
@@ -201,6 +447,7 @@ def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
     cb(1, "Đang chuẩn bị...")
     _ensure_whisper(models_dir, _scaled(cb, 2, 8))
     vocal_out = os.path.join(work, "vocal.wav")
+    gate_wav = None  # stem giọng (nếu có) cho cổng kiểm thiếu lời phần đầu
     if texts or sep_mode == "fast":
         # Có lời dán sẵn (chỉ cần mốc giờ từng từ trên bản phối) hoặc chế độ
         # nhanh (không có stem giọng): tách beat và nghe lời là hai việc
@@ -246,6 +493,8 @@ def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
                          progress_cb=_scaled(cb, 8, 40),
                          vocal_out=vocal_out)
         hear_src = vocal_out if os.path.exists(vocal_out) else song_wav
+        if hear_src == vocal_out:
+            gate_wav = vocal_out
         segs = alg.transcribe_segments(hear_src, duration,
                                        _scaled(cb, 40, 74), models_dir)
     ctx.update(inst_wav=inst_out, inst_mode=sep_mode)
@@ -267,11 +516,15 @@ def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
             "Không tạo được lời từ bài này — thử dán lời vào bước 3 rồi "
             "bấm Tự căn bằng AI")
     timed = lyr.assign_ends(raw, duration)
+    if source == "ai":
+        _check_lyric_lines(timed, duration, gate_wav)
     st, size, bar = style_render_opts(style)
     if title:
         st["title"] = title
+    ass_text = lyr.build_ass(timed, st)
+    _require_ass_events(ass_text)
     with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(lyr.build_ass(timed, st))
+        f.write(ass_text)
     cb(80, "Đang xuất video...")
     audio = inst_out
     if guide > 0:
@@ -280,9 +533,19 @@ def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
         audio = mixed
     media.render_video(bg, audio, ass_path, out_mp4, duration,
                        _scaled(cb, 80, 100), size=size, progress_bar=bar)
+    verify_export_text(out_mp4, timed, st)
     ctx["out_mp4"] = out_mp4
-    return {"video": video_url, "lines": timed, "matched": matched,
-            "source": source, "count": len(timed)}
+    result = {"video": video_url, "lines": timed, "matched": matched,
+              "source": source, "count": len(timed)}
+    if source == "ai":
+        # User chốt 07/11: lời chuẩn là lời DÁN + AI căn giờ; lời tự chép
+        # chỉ là BẢN NHÁP — phải nói rõ ngay trong kết quả, không để ai
+        # tưởng đây là lời chuẩn.
+        result["warning"] = (
+            "Đang dùng lời AI TỰ CHÉP (bản nháp) — AI nghe hát hay sai "
+            "chữ. Muốn lời chuẩn: dán lời bài hát rồi bấm 'Tự căn nhịp "
+            "bằng AI'")
+    return result
 
 
 def start_job(kind, fn):
@@ -357,6 +620,7 @@ def _run_batch_item(item, opts):
             pass
         bg = resolve_bg(opts["bg"], ctx,
                         style_render_opts(opts.get("style"))[1])
+        _require_bg_resolved(opts["bg"], bg)
         return run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
                             opts["style"], yt_title, opts["guide"], bg,
                             video_url=f"/api/batch/{item['id']}/video")
@@ -378,6 +642,7 @@ def _run_batch_item(item, opts):
     else:
         bg = resolve_bg(opts["bg"], ctx,
                         style_render_opts(opts.get("style"))[1])
+        _require_bg_resolved(opts["bg"], bg)
     return run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
                         opts["style"], yt_title, opts["guide"], bg,
                         video_url=f"/api/batch/{item['id']}/video")
@@ -537,9 +802,12 @@ def _project_ctx(pid):
         ctx["inst_wav"] = iw
         ctx["inst_mode"] = data.get("inst_mode")
     for key in ("bg_image", "bg_video"):
-        hits = sorted(glob.glob(os.path.join(pdir, key + ".*")))
+        hits = glob.glob(os.path.join(pdir, key + ".*"))
         if hits:
-            ctx[key] = hits[0]
+            # File MỚI NHẤT thắng: thư mục có thể còn file nền cũ khác đuôi
+            # (từ trước khi upload biết tự dọn) — không để file cũ đè nền
+            # user vừa chọn khi xuất.
+            ctx[key] = max(hits, key=lambda p: os.path.getmtime(p))
     om = os.path.join(pdir, "karaoke.mp4")
     if os.path.exists(om):
         ctx["out_mp4"] = om
@@ -781,10 +1049,13 @@ def _run_export_item(item):
     st, size, bar = style_render_opts(style)
     pdir = ctx["_work"]
     ass_path = os.path.join(pdir, "lyrics.ass")
+    ass_text = lyr.build_ass(timed, st)
+    _require_ass_events(ass_text, burn=cfg.get("burn", True))
     with open(ass_path, "w", encoding="utf-8") as f:
-        f.write(lyr.build_ass(timed, st))
+        f.write(ass_text)
     bg = resolve_bg(data.get("bg") or {"type": "gradient", "value": "demtim"},
                     ctx, size)
+    _require_bg_resolved(data.get("bg"), bg)
     audio = ctx["inst_wav"] or ctx["song_wav"]
     try:
         guide = float(data.get("guide") or 0)
@@ -814,6 +1085,17 @@ def _run_export_item(item):
         encoder=_resolve_encoder(cfg.get("encoder") or "auto"),
         bitrate_k=QUALITY_KBPS.get(cfg.get("quality") or "cao"),
         bg_blur=style.get("bg_blur") or 0)
+    if cfg.get("burn", True):
+        try:
+            verify_export_text(out_mp4, timed, st)
+        except Exception:
+            # Video không đạt cổng kiểm: xoá khỏi thư mục lưu của user,
+            # không để file hỏng nằm đó như một sản phẩm "đã xong".
+            try:
+                os.remove(out_mp4)
+            except OSError:
+                pass
+            raise
     if cfg.get("export_ass"):
         shutil.copyfile(ass_path, os.path.splitext(out_mp4)[0] + ".ass")
     proj_mp4 = os.path.join(pdir, "karaoke.mp4")
@@ -964,6 +1246,29 @@ class Handler(BaseHTTPRequestHandler):
                 serve_file(self, STATE["inst_wav"], "audio/wav")
             elif path == "/api/video" and STATE["out_mp4"]:
                 serve_file(self, STATE["out_mp4"], "video/mp4")
+            elif path == "/api/bg-preview":
+                # Phát đúng file nền của phiên hiện tại (STATE đi theo
+                # project đang mở) — cùng một file mà khâu xuất sẽ dùng.
+                qs = urllib.parse.parse_qs(parsed.query)
+                kind = (qs.get("kind") or ["video"])[0]
+                if kind == "image":
+                    src = STATE["bg_image"]
+                    if not src or not os.path.exists(src):
+                        return self._json(
+                            {"error": "Chưa có ảnh nền — hãy tải ảnh nền "
+                                      "trước"}, 404)
+                    serve_file(self, src, _BG_IMAGE_CTYPES.get(
+                        os.path.splitext(src)[1].lower(),
+                        "application/octet-stream"))
+                else:
+                    src = STATE["bg_video"]
+                    if not src or not os.path.exists(src):
+                        return self._json(
+                            {"error": "Chưa có video nền — hãy tải video "
+                                      "nền trước"}, 404)
+                    serve = _bg_preview_file(src) or src
+                    serve_file(self, serve, _BG_VIDEO_CTYPES.get(
+                        os.path.splitext(serve)[1].lower(), "video/mp4"))
             elif path == "/api/download" and STATE["out_mp4"]:
                 serve_file(self, STATE["out_mp4"], "video/mp4",
                            download_name="karaoke.mp4")
@@ -1099,6 +1404,16 @@ class Handler(BaseHTTPRequestHandler):
                     self.headers.get("X-File-Name") or "bg.bin")
                 ext = os.path.splitext(name)[1] or ".bin"
                 key = "bg_image" if path.endswith("image") else "bg_video"
+                # Dọn file nền cũ cùng loại (kể cả khác đuôi): không dọn
+                # thì trong thư mục tồn tại 2 ứng viên và khâu xuất có
+                # thể nhặt lại file cũ thay vì nền user vừa chọn.
+                for old in glob.glob(os.path.join(STATE["_work"], key + ".*")):
+                    try:
+                        os.remove(old)
+                    except OSError:
+                        pass
+                if key == "bg_video":
+                    _drop_bg_preview(STATE["_work"])
                 dst = os.path.join(STATE["_work"], key + ext)
                 with open(dst, "wb") as f:
                     f.write(payload)
@@ -1163,7 +1478,12 @@ class Handler(BaseHTTPRequestHandler):
 
                 def job(cb):
                     from karaoke import align as alg
-                    heard = alg.transcribe_words(song_wav, duration, cb,
+                    # Đã tách AI trước đó (có vocal.wav) thì nghe mốc từng
+                    # từ trên STEM GIỌNG: sạch tiếng nhạc đè, mốc chuẩn
+                    # hơn nghe trên bản phối.
+                    vocal = os.path.join(STATE["_work"], "vocal.wav")
+                    hear = vocal if os.path.exists(vocal) else song_wav
+                    heard = alg.transcribe_words(hear, duration, cb,
                                                   models_dir)
                     full = alg.align_full(heard, texts, duration)
                     line_ok = full.get("line_ok") or []
@@ -1216,9 +1536,18 @@ class Handler(BaseHTTPRequestHandler):
                 st, size, bar = style_render_opts(style)
                 workdir = STATE["_work"]
                 ass_path = os.path.join(workdir, "lyrics.ass")
+                ass_text = lyr.build_ass(timed, st)
+                try:
+                    _require_ass_events(ass_text)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
                 with open(ass_path, "w", encoding="utf-8") as f:
-                    f.write(lyr.build_ass(timed, st))
+                    f.write(ass_text)
                 bg = self._resolve_bg(bg_req, style)
+                try:
+                    _require_bg_resolved(bg_req, bg)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
                 out_mp4 = os.path.join(workdir, "karaoke.mp4")
                 song_wav = STATE["song_wav"]
                 _mark_current_project(lines=_sanitize_lines(lines),
@@ -1232,6 +1561,7 @@ class Handler(BaseHTTPRequestHandler):
                         audio = mixed
                     media.render_video(bg, audio, ass_path, out_mp4, duration,
                                        cb, size=size, progress_bar=bar)
+                    verify_export_text(out_mp4, timed, st)
                     STATE["out_mp4"] = out_mp4
                     _mark_current_project(exported=True)
                     return {"video": "/api/video"}
@@ -1267,9 +1597,13 @@ class Handler(BaseHTTPRequestHandler):
                     guide = float(req.get("guide") or 0)
                 except (TypeError, ValueError):
                     guide = 0.0
-                bg = self._resolve_bg(req.get("bg")
-                                      or {"type": "gradient", "value": "demtim"},
-                                      style)
+                bg_req = req.get("bg") or {"type": "gradient",
+                                           "value": "demtim"}
+                bg = self._resolve_bg(bg_req, style)
+                try:
+                    _require_bg_resolved(bg_req, bg)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
                 if STATE["duration"] <= 0:
                     return self._json(
                         {"error": "Không đọc được thời lượng bài hát"}, 400)
@@ -1339,6 +1673,8 @@ class Handler(BaseHTTPRequestHandler):
                         STATE["bg_video"] = video_path
                     bg = ({"type": "video", "value": video_path}
                           if video_path else fallback_bg)
+                    if not video_path:
+                        _require_bg_resolved(req.get("bg"), fallback_bg)
                     res = run_pipeline(_scaled(cb, 18, 100), STATE, texts,
                                        sep_mode, style,
                                        title_req or yt_title, guide, bg)

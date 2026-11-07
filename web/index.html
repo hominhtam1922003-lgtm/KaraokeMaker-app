@@ -110,10 +110,10 @@
     <!-- Cột trái: dòng lời -->
     <div class="col-lines">
       <div class="col-head"><b>Dòng lời</b><span class="mut" id="lineStats"></span></div>
-      <details class="tools" id="lyricTools">
-        <summary>Thêm / căn lời · tách beat</summary>
-        <p class="hint">Để trống thì AI tự chép lời (nghe trên giọng hát đã tách riêng). Có lời đúng thì dán vào — AI khớp theo từng từ, chuẩn hơn hẳn. Dòng “subscribe / cảm ơn đã xem...” của kênh tự bị lọc bỏ.</p>
-        <textarea id="lyricsText" rows="5" placeholder="Dán lời bài hát vào đây, mỗi dòng một câu... (hoặc để trống cho AI tự chép)"></textarea>
+      <details class="tools" id="lyricTools" open>
+        <summary>Lời & căn nhịp · tách beat</summary>
+        <p class="hint"><b>Đường chuẩn:</b> dán lời đúng của bài (mỗi dòng một câu) → bấm <b>Dùng lời này</b> → bấm <b>Tự căn nhịp bằng AI</b>. Lời chuẩn 100%, AI chỉ lo gắn mốc giờ. Dòng “subscribe / cảm ơn đã xem...” của kênh tự bị lọc bỏ.</p>
+        <textarea id="lyricsText" rows="5" placeholder="Dán lời bài hát vào đây, mỗi dòng một câu..."></textarea>
         <div class="row">
           <button class="btn small" id="btnUseLyrics">Dùng lời này</button>
           <label class="btn small" for="lrcFile">Nạp file .lrc</label>
@@ -127,11 +127,15 @@
           <a class="dl" id="dlBeat" href="/api/download-inst" hidden>⬇ Tải beat</a>
         </div>
         <div class="row">
-          <button class="btn grad small" id="btnAutoAlign">✨ Tự căn nhịp bằng AI</button>
-          <span class="hint">AI nghe rồi gắn mốc từng câu. Câu lệch bấm −0,1s/+0,1s ở câu đó.</span>
+          <button class="btn grad" id="btnAutoAlign">✨ Tự căn nhịp bằng AI (theo lời đã dán)</button>
+        </div>
+        <p class="hint">Câu gắn ⚠ Chưa khớp: nghe thử rồi chỉnh −0,1s/+0,1s ở câu đó hoặc gắn nhịp tay — sửa trước khi xuất.</p>
+        <div class="row">
+          <button class="btn small" id="btnAutoAll">⚡ Làm trọn gói: tách beat + căn lời đã dán + xuất</button>
         </div>
         <div class="row">
-          <button class="btn small" id="btnAutoAll">⚡ Làm tự động trọn gói (tách + chép + xuất)</button>
+          <button class="btn small" id="btnDraftAll">🤖 AI tự chép lời</button>
+          <span class="hint">Bản nháp tự chép — nghe hát hay sai chữ, chỉ dùng khi không có lời.</span>
         </div>
         <span class="ok" id="lyricsOk"></span>
       </details>
@@ -141,6 +145,8 @@
     <!-- Cột giữa: xem trước + vận chuyển + sóng -->
     <div class="col-center">
       <div class="preview" id="pvBox">
+        <video class="pv-bg" id="pvBgVideo" muted loop playsinline preload="auto" hidden></video>
+        <img class="pv-bg" id="pvBgImage" alt="" hidden>
         <span class="pv-badge" id="pvRatioBadge">XEM TRƯỚC · 16:9</span>
         <span class="pv-badge right" id="pvTimeBadge">0:00 / 0:00</span>
         <div class="pv-bar" id="pvBar" hidden></div>

@@ -155,3 +155,136 @@ của khung chỉ dùng để biết phần nào phải bỏ).
 - Bump workflow lên tag v4.0.0 + push từ chat trực tiếp (bản này KHÔNG
   đụng `.github/workflows` theo lệnh phân công).
 - Chạy Cổng Chạy Thử trên APK/exe thật trước phán quyết GO như luật nhà.
+
+
+---
+
+# Đợt vá 07/11/2026 (Quan Hiểu Đồng) — nền xem trước · "thành công giả" · chuỗi lời
+
+Bối cảnh: 3 bằng chứng máy thật trên bản exe giao diện 3 bước (v3.0.0; pipeline
+xử lý là cùng dòng mã với v4 — xem header web/app.js): (1) chip "Nền: video
+của bạn" nhưng xem trước tối trơn; (2) xuất "xong" mà video chỉ có gradient
+tím + nhạc, không chữ, không phải nền đã chọn; (3) video có chữ ở nửa sau —
+nửa đầu không lời, lời sai be bét ("Okey don't idols").
+
+## Nguyên nhân gốc (đã chứng minh bằng code + số đo)
+
+1. **Xem trước**: `pvRender()` với nền ảnh/video chỉ tô màu `#232a45` + gắn
+   nhãn — không hề nạp file; server không có route phát file nền. Lỗi CHỈ ở
+   xem trước trên đường chuẩn (xuất qua `media.render_video` có
+   `-stream_loop -1` dùng đúng file, đã tái hiện: nền đỏ → khung đỏ thật).
+2. **Xuất mất nền**: hai lỗi thầm — (a) upload nền lần 2 khác đuôi không dọn
+   file cũ, `_project_ctx` nhặt `sorted(glob)[0]` = file CŨ (tái hiện: xuất
+   vẫn ra nền đỏ sau khi đã đổi sang webm xanh); (b) `resolve_bg()` rơi
+   LẶNG về nền màu khi thiếu file — project lưu `bg type=video` mà không có
+   file vẫn báo "done" (tái hiện: khung ≈ #0b0e1a). Video của user ra
+   gradient tím (demtim) = cùng họ rơi-lặng-về-mặc-định ở tầng project/lưu
+   cấu hình trên bản v3.
+3. **Xuất mất chữ**: không một cổng kiểm nào tồn tại — ASS 0 sự kiện
+   Dialogue, lines chưa căn giờ, hay đốt chữ hỏng đều đi thẳng tới "done".
+4. **Chép lời sai**: `whisper_worker.py` và đường dự phòng
+   `align._transcribe_inprocess` gọi `model.transcribe(...)` KHÔNG truyền
+   `language` → Whisper tự nhận diện ngôn ngữ từ 30s đầu, `_info` bị vứt bỏ
+   không kiểm. ĐO THẬT (xem mục Kiểm): trên bài hát tiếng Việt, nhận diện
+   ra **tiếng Anh (en, prob 0,79)** → giải mã cả bài như tiếng Anh.
+5. **Mất nửa đầu**: pipeline không có cổng phủ lời nào; chép sai ngôn ngữ
+   làm độ phủ sụp (34% so với 51% khi khoá tiếng Việt trên cùng dữ liệu)
+   và các đoạn đầu bị bộ lọc rác loại — không gì chặn việc xuất tiếp.
+
+## Đã sửa
+
+- **Xem trước nền thật** (`app.py`, `web/index.html`, `web/app.js`,
+  `web/style.css`): route mới `GET /api/bg-preview?kind=video|image` phát
+  ĐÚNG file mà khâu xuất dùng (một nguồn sự thật — STATE đi theo project
+  đang mở); codec lạ (HEVC/VP9-in-MP4/MPEG-4...) được chuyển mã bản xem
+  trước H.264 `bg_preview.mp4` cạnh file gốc (cache theo mtime:size; file
+  gốc giữ nguyên cho xuất); nền WebView2 không đọc được/thiếu file → hiện
+  thông báo rõ trong khung xem trước, không im lặng tối trơn. `pvRender`
+  gắn `<video>`/`<img>` thật làm lớp nền (blur chỉ áp lên media, đồng bộ
+  play/seek theo audio), lỗi tải → `pvBgFailed` phân biệt 404 (chưa có
+  file) với lỗi định dạng.
+- **Xuất dùng đúng nền**: upload dọn mọi file nền cũ cùng loại (kể cả khác
+  đuôi) + xoá cache xem trước; `_project_ctx` chọn file nền theo mtime mới
+  nhất; `_require_bg_resolved()` — yêu cầu nền image/video mà resolve ra
+  khác loại → lỗi rõ "Chưa tìm thấy file nền..." — gắn ở hàng đợi xuất,
+  `/api/render`, `/api/auto-all`, job auto-link, cả 2 nhánh resolve của
+  batch (batch còn lại đi qua `run_pipeline` như cũ).
+- **Cổng chữ hai lớp — áp MỌI đường xuất có đốt chữ**: (i) tiền xuất
+  `_require_ass_events()` — ASS sắp đốt có 0 Dialogue → chặn trước render;
+  (ii) sau xuất `verify_export_text()` — trích khung ở 45% + 75% của câu
+  đầu/giữa/cuối từ chính MP4 vừa xuất, đếm pixel màu chữ của style (đã
+  hát/chưa hát/song ca) hoặc gần trắng ở nửa dưới khung; ngưỡng
+  `max(30px, 0,08% dải)` — hiệu chuẩn từ ca thật H2 (câu ngắn 3 chữ trên
+  khung 1080p chỉ cho 98–115px ở khung mẫu; video trơn trên nền phẳng
+  ~0px). Không đạt → job lỗi "Video xuất ra KHÔNG thấy chữ karaoke...",
+  hàng đợi còn xoá file hỏng khỏi thư mục lưu của user. Gắn ở
+  `run_pipeline` (phủ cả auto-all/auto-link/batch), `_run_export_item`,
+  job `/api/render`. `burn=False` bỏ qua theo thiết kế (user chủ động
+  không đốt chữ).
+- **Chuỗi lời**: khoá `language="vi"` ở worker + đường dự phòng (mồi tiếng
+  Việt giữ nguyên — mồi không khoá được ngôn ngữ, chỉ là phụ trợ). Cổng
+  phủ lời `_check_lyric_lines()` trong `run_pipeline` (nhánh tự chép):
+  mốc giờ ngoài thời lượng bài → chặn; câu đầu bắt đầu sau 25% bài MÀ
+  stem giọng đo RMS ≥ 0,015 trong 25% đầu (có hát thật) → chặn với thông
+  điệp chỉ đường chuẩn. `/api/auto-align` ưu tiên nghe mốc từng từ trên
+  stem giọng nếu đã tách.
+- **Luồng lời theo lệnh chốt của user (07/11)**: đường CHÍNH là dán lời +
+  AI căn giờ. Panel lời trong Studio mở sẵn; hướng dẫn 1 dòng "Đường
+  chuẩn: dán lời → Dùng lời này → Tự căn nhịp bằng AI"; nút Tự căn là nút
+  chính (grad, lớn); hàng đợi "Làm trọn gói" bắt buộc đã có lời dán; nút
+  AI tự chép tách riêng, ghi nhãn **"Bản nháp tự chép — nghe hát hay sai
+  chữ, chỉ dùng khi không có lời"**; pipeline trả `warning` khi dùng lời
+  tự chép và `pollJob` nổi cảnh báo ngay khi job xong; `lineStats` hiện
+  "⚠ N câu CHƯA KHỚP — nghe thử & sửa trước khi xuất" màu cảnh báo (chip
+  ⚠ Chưa khớp từng câu đã có từ v4, nay có tổng đếm nổi bật).
+
+## Kiểm — số đo thật
+
+- **Thử Whisper trên bài hát thật** ("Duyên Phận", bản Thái Thịnh —
+  YouTube chặn IP VM bằng 429/bot-check nên lấy từ SoundCloud; 150 giây
+  đầu, BẢN PHỐI, model small int8): 
+  - Hành vi CŨ (không khoá ngôn ngữ): `info.language=en, prob=0,79` —
+  23 câu, phủ 34%, **tỉ lệ câu có dấu tiếng Việt = 0,00**; đầu ra toàn
+  tiếng Anh bịa: "The day I'm lazy when I'm speaking", "You're my star",
+  "What do u call me?" — đúng chữ ký lỗi user chụp.
+  - Khoá `language="vi"` (gọi trực tiếp): 24 câu, phủ 51%, tỉ lệ VI 0,96.
+  - Qua worker của app (code sau sửa): 20 câu, phủ 44%, tỉ lệ VI 1,00.
+  - Chất lượng vùng hát khi khoá: tiếng Việt đọc được nhưng còn sai câu
+  chữ (model small + beam 1 + hát) — đúng bản chất BẢN NHÁP; kèm hiện
+  tượng bịa 3 dòng trên đoạn nhạc dạo (hệ quả `vad_filter=False` theo
+  thiết kế). Đây là lý do đường dán lời là đường sản xuất.
+  - Lượt đo trên STEM GIỌNG: MDX tách xong (có file vocal 150s) nhưng
+  file stem bị một tiến trình ngoài trên VM dùng chung xoá mất trước khi
+  đo (không rõ nguồn; đã kiểm không phải code app) — ô stem-vs-phối chưa
+  đo lại được trong đợt này; cổng phủ lời đã kiểm bằng stem tổng hợp có
+  kiểm soát (P16).
+- **Lưới test**: `test_projects.py` **16/16** (thêm P11–P16: preview phát
+  đúng file + xuất đúng nền đỏ; đổi đuôi webm → 1 file + preview + xuất
+  xanh kể cả nền 0,6s ngắn hơn bài; xoá file nền → hàng đợi ERROR rõ;
+  file giả danh → 400, codec MPEG-4 → preview chuyển mã H.264 còn gốc
+  nguyên; cổng chữ nhận video có chữ/chặn video trơn; cổng lời 3 ca) ·
+  `test_errors.py` **34/34** · `test_auto`, `test_ass2`, `test_align`,
+  `test_batch`, `test_link`: FAILED none · `test_whisper` 14/14 ·
+  `smoke_server.py` SMOKE PASS · `node --check web/app.js` +
+  `py_compile`: OK. (Ca H2 của test_errors từng bị cổng chữ chặn oan —
+  câu ngắn 98–115px dưới ngưỡng đầu 194px; đã hiệu chuẩn lại ngưỡng như
+  ghi ở trên và H2 qua 34/34.)
+- **Xuất thử có trích khung**: P11 (nền đỏ: mean R thắng tuyệt đối), P12
+  (nền lime webm ở giây 1,6 — nền ngắn đã lặp đúng), P15 (video có chữ
+  qua cổng, video trơn bị cổng chặn), repro H2 (khung 480px: vàng 33px +
+  trắng ~80px/câu ngắn).
+
+## Phát hiện phụ + việc gác lại (đợt sau)
+
+- Tải model Whisper lần đầu qua huggingface_hub 2.4.0 (đường xet) có lúc
+  văng `open() got an unexpected keyword argument 'metadata_errors'` —
+  thử lại thì tải xong và model chạy bình thường. `requirements.txt`
+  KHÔNG ghim phiên bản (`faster-whisper>=1.0`) nên bản exe đóng gói theo
+  thư viện mới nhất tại thời điểm build — đề xuất đợt sau: ghim phiên
+  bản + dịch thông điệp lỗi tải model sang tiếng Việt rõ ràng.
+- Hàng đợi xuất của project có trường hợp chưa qua cổng nền: cấu hình
+  `burn=False` (chủ động không đốt chữ) — theo thiết kế, không phải lỗi.
+- Cổng pixel là lưới thứ hai sau cổng đếm sự kiện ASS: trên nền video
+  rất sáng/bận rộn, pixel gần-trắng của chính nền có thể làm cổng dễ qua
+  — chấp nhận ở mức lưới bắt thảm hoạ "đốt mà không ra chữ"; kiểm bằng
+  mắt khi nghiệm thu vẫn là chốt cuối.

@@ -427,7 +427,8 @@ def _transcribe_inprocess(wav_path, duration=0.0, progress_cb=None,
     segments = []
     try:
         segs, _info = model.transcribe(
-            wav_path, word_timestamps=True, beam_size=1, vad_filter=False,
+            wav_path, language="vi",  # khoá cứng như worker — xem whisper_worker
+            word_timestamps=True, beam_size=1, vad_filter=False,
             condition_on_previous_text=False,
             initial_prompt="Sau đây là lời một bài hát tiếng Việt, được hát "
                            "rõ ràng và viết có dấu đầy đủ.")

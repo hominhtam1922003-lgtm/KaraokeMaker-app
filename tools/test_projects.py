@@ -304,6 +304,212 @@ def _():
     assert "Mẫu test" not in [x["name"] for x in j["items"]]
 
 
+FFMPEG = appmod.media.ffmpeg_bin()
+FFPROBE = os.path.join(os.path.dirname(FFMPEG), "ffprobe")
+
+
+def make_video(path, color="red", secs=3.0, codec="libx264", size="320x240"):
+    import subprocess
+    cmd = [FFMPEG, "-y", "-v", "error", "-f", "lavfi",
+           "-i", f"color=c={color}:s={size}:r=10:d={secs}",
+           "-c:v", codec, "-pix_fmt", "yuv420p", path]
+    r = subprocess.run(cmd, capture_output=True, text=True)
+    assert r.returncode == 0, r.stderr[-300:]
+    return path
+
+
+def frame_mean(path, at=0.6, w=160):
+    import subprocess
+    cmd = [FFMPEG, "-v", "error", "-ss", str(at), "-i", path,
+           "-frames:v", "1", "-vf", f"scale={w}:-2",
+           "-f", "rawvideo", "-pix_fmt", "rgb24", "-"]
+    r = subprocess.run(cmd, capture_output=True)
+    assert r.returncode == 0 and r.stdout, "không trích được khung"
+    a = np.frombuffer(r.stdout, dtype=np.uint8).astype(float)
+    return tuple(round(float(a[i::3].mean()), 1) for i in range(3))
+
+
+def probe_codec(path):
+    import subprocess
+    r = subprocess.run([FFPROBE, "-v", "error", "-select_streams", "v:0",
+                        "-show_entries", "stream=codec_name",
+                        "-of", "csv=p=0", path],
+                       capture_output=True, text=True)
+    return r.stdout.strip()
+
+
+def queue_and_wait(pid, out_dir, fname, timeout=300):
+    st, j = http_json("POST", "/api/export/queue", {
+        "project_id": pid,
+        "config": {"format": "fb", "encoder": "cpu", "quality": "thap",
+                   "burn": True, "export_ass": False,
+                   "out_dir": out_dir, "filename": fname}})
+    assert st == 200 and j["item"], (st, j)
+    iid = j["item"]
+    deadline = time.time() + timeout
+    item = None
+    while time.time() < deadline:
+        st, j = http_json("GET", "/api/export/queue")
+        item = next((x for x in j["items"] if x["id"] == iid), None)
+        if item and item["status"] in ("done", "error"):
+            break
+        time.sleep(1.0)
+    assert item is not None, "hết giờ chờ hàng đợi"
+    return item
+
+
+def bg_project(song_secs=2.0):
+    wav = write_wav(f"{TMP}/bgsong{song_secs}.wav", song_secs)
+    with open(wav, "rb") as f:
+        payload = f.read()
+    st, j = http_json("POST", "/api/projects/import-file", payload,
+                      {"X-File-Name": "bgsong.wav"})
+    assert st == 200, (st, j)
+    pid = j["project"]["id"]
+    st, j = http_json("POST", f"/api/projects/{pid}/open", {})
+    assert st == 200, (st, j)
+    st, j = http_json("POST", "/api/project/current", {
+        "lines": [{"text": "Câu một hát thử", "start": 0.2},
+                  {"text": "Câu hai hát thử", "start": 1.1}],
+        "bg": {"type": "video"}})
+    assert st == 200, (st, j)
+    return pid
+
+
+@scenario("P11 nền video tự chọn: preview phát đúng file + xuất ra đúng nền đỏ")
+def _():
+    pid = bg_project()
+    CTX["bg_pid"] = pid
+    make_video(f"{TMP}/red.mp4", "red")
+    with open(f"{TMP}/red.mp4", "rb") as f:
+        payload = f.read()
+    import urllib.parse
+    st, j = http_json("POST", "/api/upload-bg-video", payload,
+                      {"X-File-Name": urllib.parse.quote("nền đỏ của tôi.mp4")})
+    assert st == 200, (st, j)
+    st, raw, hdrs = http("GET", "/api/bg-preview?kind=video")
+    assert st == 200, st
+    assert (hdrs.get("Content-Type") or "").startswith("video/mp4"), hdrs
+    assert len(raw) > 1000, len(raw)
+    item = queue_and_wait(pid, os.path.join(TMP, "out11"), "p11")
+    assert item["status"] == "done", item
+    r, g, b = frame_mean(item["saved_path"], 0.6)
+    assert r > 170 and g < 100 and b < 100, (r, g, b)
+
+
+@scenario("P12 đổi nền khác đuôi: file cũ bị dọn, preview + xuất theo file MỚI (webm xanh, ngắn hơn bài vẫn lặp)")
+def _():
+    pid = CTX["bg_pid"]
+    make_video(f"{TMP}/green.webm", "lime", secs=0.6, codec="libvpx-vp9")
+    with open(f"{TMP}/green.webm", "rb") as f:
+        payload = f.read()
+    st, j = http_json("POST", "/api/upload-bg-video", payload,
+                      {"X-File-Name": "green.webm"})
+    assert st == 200, (st, j)
+    import glob as globmod
+    files = globmod.glob(os.path.join(appmod.PROJECTS_DIR, pid, "bg_video.*"))
+    assert len(files) == 1 and files[0].endswith(".webm"), files
+    st, raw, hdrs = http("GET", "/api/bg-preview?kind=video")
+    assert st == 200, st
+    assert (hdrs.get("Content-Type") or "").startswith("video/webm"), hdrs
+    item = queue_and_wait(pid, os.path.join(TMP, "out12"), "p12")
+    assert item["status"] == "done", item
+    r, g, b = frame_mean(item["saved_path"], 1.6)
+    assert g > 140 and r < 110, (r, g, b)
+
+
+@scenario("P13 chọn nền video nhưng file bị xoá -> hàng đợi ERROR rõ, không 'done' tối")
+def _():
+    pid = CTX["bg_pid"]
+    import glob as globmod
+    for f in globmod.glob(os.path.join(appmod.PROJECTS_DIR, pid, "bg_video.*")):
+        os.remove(f)
+    item = queue_and_wait(pid, os.path.join(TMP, "out13"), "p13")
+    assert item["status"] == "error", item
+    assert "nền" in (item.get("error") or ""), item.get("error")
+
+
+@scenario("P14 file giả danh -> 400; codec lạ (mpeg4) -> preview chuyển mã H.264, file gốc giữ nguyên")
+def _():
+    pid = CTX["bg_pid"]
+    st, j = http_json("POST", "/api/upload-bg-video",
+                      b"day chi la chu, khong phai video",
+                      {"X-File-Name": "fake.mp4"})
+    assert st == 400, (st, j)
+    make_video(f"{TMP}/odd.mp4", "blue", codec="mpeg4")
+    assert probe_codec(f"{TMP}/odd.mp4") == "mpeg4"
+    with open(f"{TMP}/odd.mp4", "rb") as f:
+        payload = f.read()
+    st, j = http_json("POST", "/api/upload-bg-video", payload,
+                      {"X-File-Name": "odd.mp4"})
+    assert st == 200, (st, j)
+    st, raw, hdrs = http("GET", "/api/bg-preview?kind=video")
+    assert st == 200 and len(raw) > 1000, (st, len(raw))
+    prev = f"{TMP}/prev14.mp4"
+    with open(prev, "wb") as f:
+        f.write(raw)
+    assert probe_codec(prev) == "h264", probe_codec(prev)
+    r, g, b = frame_mean(prev, 0.5)
+    assert b > 140 and r < 110, (r, g, b)
+    orig = os.path.join(appmod.PROJECTS_DIR, pid, "bg_video.mp4")
+    assert probe_codec(orig) == "mpeg4", probe_codec(orig)
+
+
+@scenario("P15 cổng chữ: ASS 0 sự kiện bị chặn; verify khung hình (có chữ đạt, trơn chữ trượt)")
+def _():
+    try:
+        appmod._require_ass_events("[Events]\nFormat: x\n")
+        raise AssertionError("ASS rỗng mà không bị chặn")
+    except ValueError:
+        pass
+    appmod._require_ass_events("Dialogue: 0,0:00:00.00,0:00:01.00,,,,,,,,")
+    appmod._require_ass_events("", burn=False)
+    wav = write_wav(f"{TMP}/gate.wav", 2.0)
+    timed = [{"text": "Câu kiểm cổng chữ", "start": 0.2, "end": 1.8,
+              "words": [[0.2, "Câu"], [0.7, "kiểm"], [1.2, "cổng"],
+                        [1.5, "chữ"]]}]
+    style = {"color": "#FFD400", "base_color": "#FFFFFF"}
+    bare = f"{TMP}/bare.mp4"
+    appmod.media.render_video({"type": "color", "value": "#202040"}, wav,
+                              None, bare, 2.0, lambda *a: None,
+                              size=(640, 360))
+    try:
+        appmod.verify_export_text(bare, timed, style)
+        raise AssertionError("video trơn chữ mà cổng vẫn cho qua")
+    except RuntimeError:
+        pass
+    ass_path = f"{TMP}/gate.ass"
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(appmod.lyr.build_ass(appmod.lyr.assign_ends(timed, 2.0),
+                                     dict(style)))
+    good = f"{TMP}/good.mp4"
+    appmod.media.render_video({"type": "color", "value": "#202040"}, wav,
+                              ass_path, good, 2.0, lambda *a: None,
+                              size=(640, 360))
+    appmod.verify_export_text(good, timed, style)  # không ném lỗi = đạt
+
+
+@scenario("P16 cổng lời: thiếu lời phần đầu dù CÓ tiếng hát -> chặn; intro im lặng -> qua; mốc ngoài bài -> chặn")
+def _():
+    tone = write_wav(f"{TMP}/voc_tone.wav", 2.0, kind="tone")
+    silence = write_wav(f"{TMP}/voc_sil.wav", 2.0, kind="silence")
+    late = [{"text": "Câu đầu muộn", "start": 120.0, "end": 124.0}]
+    try:
+        appmod._check_lyric_lines(late, 300.0, tone)
+        raise AssertionError("thiếu nửa đầu có hát mà không bị chặn")
+    except ValueError:
+        pass
+    appmod._check_lyric_lines(late, 300.0, silence)   # dạo dài im -> qua
+    appmod._check_lyric_lines([{"text": "Câu sớm", "start": 5.0,
+                                "end": 8.0}], 300.0, tone)  # đầu đủ sớm
+    try:
+        appmod._check_lyric_lines([{"text": "Câu lạc", "start": 400.0,
+                                    "end": 401.0}], 300.0, None)
+        raise AssertionError("mốc ngoài thời lượng mà không bị chặn")
+    except ValueError:
+        pass
+
+
 @scenario("P10 cuối lưới: server vẫn khoẻ, trang chủ 200, app-info version 4.0.0")
 def _():
     st, raw, _h = http("GET", "/")
