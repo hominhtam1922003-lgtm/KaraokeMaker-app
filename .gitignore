@@ -1,0 +1,11 @@
+.venv/
+work/
+models/*.onnx
+dist/
+build/
+__pycache__/
+*.pyc
+ffmpeg
+ffprobe
+ffmpeg.exe
+ffprobe.exe

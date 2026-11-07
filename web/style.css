@@ -1,0 +1,75 @@
+:root {
+  --bg: #0b0e1a; --card: #141a2e; --card2: #1a2140; --line: #2a3358;
+  --text: #eef1ff; --dim: #9aa5cc; --accent: #ffd400; --accent2: #7c5cff;
+  --ok: #69f0ae; --err: #ff6b81;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0; background: var(--bg); color: var(--text);
+  font-family: "Segoe UI", system-ui, -apple-system, Arial, sans-serif;
+}
+header {
+  padding: 28px 20px 8px; text-align: center;
+}
+.logo { font-size: 34px; font-weight: 800; letter-spacing: .3px; }
+.tagline { color: var(--dim); margin-top: 4px; }
+main { max-width: 880px; margin: 0 auto; padding: 16px; }
+.card {
+  background: var(--card); border: 1px solid var(--line); border-radius: 16px;
+  padding: 20px 22px; margin-bottom: 18px;
+}
+.card.locked { opacity: .45; pointer-events: none; }
+.card h2 { margin: 0 0 10px; font-size: 20px; display: flex; align-items: center; gap: 10px; }
+.num {
+  background: var(--accent2); color: #fff; width: 28px; height: 28px;
+  border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  font-size: 15px; flex: none;
+}
+.hint { color: var(--dim); font-size: 14px; line-height: 1.5; }
+.drop {
+  display: block; border: 2px dashed var(--line); border-radius: 14px;
+  padding: 34px 16px; text-align: center; cursor: pointer; font-size: 17px;
+  background: var(--card2); transition: border-color .2s;
+}
+.drop:hover { border-color: var(--accent); }
+.songinfo { margin-top: 14px; }
+.songinfo audio { width: 100%; margin-top: 8px; }
+.modes { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 14px; }
+.modes.col { flex-direction: column; }
+.mode {
+  flex: 1; min-width: 230px; display: flex; gap: 10px; align-items: flex-start;
+  background: var(--card2); border: 1px solid var(--line); border-radius: 12px;
+  padding: 12px 14px; cursor: pointer; font-size: 15px;
+}
+.mode input { margin-top: 3px; accent-color: var(--accent2); }
+button, .filebtn {
+  background: var(--card2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 10px; padding: 10px 18px; font-size: 15px; cursor: pointer;
+  display: inline-block; text-decoration: none;
+}
+button:hover, .filebtn:hover { border-color: var(--accent); }
+button:disabled { opacity: .45; cursor: not-allowed; }
+button.primary {
+  background: linear-gradient(135deg, var(--accent2), #4a2fd6); border: none;
+  color: #fff; font-weight: 700;
+}
+button.big { font-size: 17px; padding: 13px 24px; }
+.progress {
+  margin-top: 14px; background: var(--card2); border-radius: 999px; height: 26px;
+  position: relative; overflow: hidden; border: 1px solid var(--line);
+}
+.progress .bar {
+  height: 100%; width: 0%; background: linear-gradient(90deg, var(--accent2), var(--accent));
+  transition: width .3s;
+}
+.progress .pct {
+  position: absolute; inset: 0; display: flex; align-items: center; justify-content: center;
+  font-size: 13px; font-weight: 700;
+}
+textarea {
+  width: 100%; background: var(--card2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 12px; padding: 12px; font-size: 15px; line-height: 1.6; resize: vertical;
+}
+.row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
+.ok { color: var
+...[truncated 2085 chars]

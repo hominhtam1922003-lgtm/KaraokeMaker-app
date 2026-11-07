@@ -1,0 +1,129 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Karaoke Maker — Làm video karaoke</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <div class="logo">🎤 Karaoke Maker</div>
+  <div class="tagline">Tách beat bằng AI · Căn nhịp lời · Xuất video karaoke chữ chạy theo từng từ</div>
+</header>
+
+<main>
+  <!-- BƯỚC 1 -->
+  <section class="card" id="step1">
+    <h2><span class="num">1</span> Bài hát</h2>
+    <p class="hint">Chọn file nhạc hoặc video (mp3, wav, m4a, flac, mp4, mkv...). App xử lý ngay trên máy này, không gửi đi đâu.</p>
+    <label class="drop" id="songDrop">
+      <input type="file" id="songFile" accept="audio/*,video/*,.flac,.m4a,.mkv" hidden>
+      <span id="songDropText">Bấm để chọn file bài hát</span>
+    </label>
+    <div class="songinfo" id="songInfo" hidden>
+      <div><b id="songName"></b> · <span id="songDur"></span></div>
+      <audio id="songPlayer" controls preload="metadata"></audio>
+    </div>
+  </section>
+
+  <!-- BƯỚC 2 -->
+  <section class="card locked" id="step2">
+    <h2><span class="num">2</span> Tách beat (bỏ giọng hát)</h2>
+    <div class="modes">
+      <label class="mode">
+        <input type="radio" name="sepmode" value="ai" checked>
+        <div><b>AI — beat sạch</b><br><span class="hint">Model AI tách giọng như phòng thu. Một bài vài phút, tuỳ máy.</span></div>
+      </label>
+      <label class="mode">
+        <input type="radio" name="sepmode" value="fast">
+        <div><b>Nhanh — cắt giọng stereo</b><br><span class="hint">Xong trong vài giây. Hợp bài mix cũ; bài hiện đại có thể còn vọng giọng và beat mỏng.</span></div>
+      </label>
+    </div>
+    <button class="primary" id="btnSeparate" disabled>Tách beat</button>
+    <div class="progress" id="sepProgress" hidden><div class="bar"></div><span class="pct">0%</span></div>
+    <div class="songinfo" id="instInfo" hidden>
+      <div>🎧 Nghe thử beat đã tách:</div>
+      <audio id="instPlayer" controls preload="metadata"></audio>
+    </div>
+  </section>
+
+  <!-- BƯỚC 3 -->
+  <section class="card locked" id="step3">
+    <h2><span class="num">3</span> Lời bài hát</h2>
+    <p class="hint">Dán lời vào ô dưới, mỗi dòng là một câu hát. Hoặc nạp file <b>.lrc</b> có sẵn mốc giờ — có .lrc thì khỏi cần căn nhịp ở bước 4.</p>
+    <textarea id="lyricsText" rows="9" placeholder="Dán lời bài hát vào đây, mỗi dòng một câu..."></textarea>
+    <div class="row">
+      <button id="btnUseLyrics">Dùng lời này</button>
+      <label class="filebtn">Nạp file .lrc<input type="file" id="lrcFile" accept=".lrc,text/plain" hidden></label>
+      <span class="ok" id="lyricsOk"></span>
+    </div>
+  </section>
+
+  <!-- BƯỚC 4 -->
+  <section class="card locked" id="step4">
+    <h2><span class="num">4</span> Căn nhịp</h2>
+    <div id="tapZone">
+      <p class="hint">Nghe nhạc rồi bấm nút <b>CÂU TIẾP</b> (hoặc phím <b>Space</b>) đúng lúc mỗi câu bắt đầu. Chữ trong video sẽ chạy theo từng từ trong câu.</p>
+      <div class="tapline" id="tapCurrent">—</div>
+      <div class="row">
+        <button class="primary big" id="btnTap">▶ Phát &amp; căn nhịp</button>
+        <button id="btnTapUndo" disabled>↩ Lùi một câu</button>
+        <button id="btnTapRestart" disabled>Làm lại từ đầu</button>
+      </div>
+      <div class="tapstatus" id="tapStatus">Đã căn 0/0 câu</div>
+    </div>
+    <div id="lineList" class="linelist"></div>
+  </section>
+
+  <!-- BƯỚC 5 -->
+  <section class="card locked" id="step5">
+    <h2><span class="num">5</span> Kiểu chữ &amp; nền</h2>
+    <div class="grid2">
+      <div>
+        <div class="lbl">Màu chữ khi hát tới</div>
+        <div class="swatches" id="colorSwatches">
+          <button class="sw active" data-color="#FFD400" style="--c:#FFD400">Vàng</button>
+          <button class="sw" data-color="#00E5FF" style="--c:#00E5FF">Xanh ngọc</button>
+          <button class="sw" data-color="#FF5C8A" style="--c:#FF5C8A">Hồng</button>
+          <button class="sw" data-color="#69F0AE" style="--c:#69F0AE">Xanh lá</button>
+          <button class="sw" data-color="#FF9100" style="--c:#FF9100">Cam</button>
+        </div>
+        <div class="lbl">Cỡ chữ: <span id="sizeVal">64</span></div>
+        <input type="range" id="fontSize" min="44" max="100" value="64">
+      </div>
+      <div>
+        <div class="lbl">Nền video</div>
+        <div class="modes col">
+          <label class="mode"><input type="radio" name="bgtype" value="color" checked><div><b>Đen đơn giản</b></div></label>
+          <label class="mode"><input type="radio" name="bgtype" value="image"><div><b>Ảnh của bạn</b></div></label>
+          <label class="mode"><input type="radio" name="bgtype" value="video"><div><b>Video nền</b></div></label>
+        </div>
+        <div class="row">
+          <label class="filebtn">Tải ảnh nền<input type="file" id="bgImageFile" accept="image/*" hidden></label>
+          <label class="filebtn">Tải video nền<input type="file" id="bgVideoFile" accept="video/*" hidden></label>
+        </div>
+        <span class="ok" id="bgOk"></span>
+      </div>
+    </div>
+  </section>
+
+  <!-- BƯỚC 6 -->
+  <section class="card locked" id="step6">
+    <h2><span class="num">6</span> Xuất video karaoke</h2>
+    <div class="lbl">Giọng dẫn (chèn một chút giọng gốc cho dễ hát theo): <span id="guideVal">0%</span></div>
+    <input type="range" id="guide" min="0" max="40" value="0">
+    <button class="primary big" id="btnRender" disabled>🎬 Xuất video MP4</button>
+    <div class="progress" id="renderProgress" hidden><div class="bar"></div><span class="pct">0%</span></div>
+    <div id="renderDone" hidden>
+      <video id="outVideo" controls></video>
+      <div class="row"><a class="filebtn" href="/api/download">⬇ Tải video karaoke.mp4</a></div>
+    </div>
+  </section>
+
+  <div class="toast" id="toast" hidden></div>
+</main>
+<footer>Mọi xử lý chạy trên máy của bạn · Karaoke Maker</footer>
+<script src="/static/app.js"></script>
+</body>
+</html>
