@@ -136,6 +136,55 @@ check("junk: real lyric kept", not lyr.is_junk_line(
 check("junk: real lyric kept 2", not lyr.is_junk_line(
     "Ngày mai em đi, biển nhớ tên em gọi về"))
 
+# 11) v4: song ca gán giọng TỪNG DÒNG (Nữ-hồng / Nam-xanh)
+VOICED = [
+    {"start": 2.0, "end": 5.0, "text": "Anh hát câu này", "voice": "m"},
+    {"start": 6.0, "end": 9.0, "text": "Em hát câu kia", "voice": "f"},
+    {"start": 10.0, "end": 13.0, "text": "Câu chưa gán giọng chẵn"},
+    {"start": 14.0, "end": 17.0, "text": "Câu chưa gán giọng lẻ"},
+]
+# Màu Nữ trùng màu hát chính -> dòng Nữ không cần thẻ thừa; dòng Nam lấy
+# màu Nam riêng (#3B82F6 -> &H00F6823B); dòng lẻ chưa gán giữ luật cũ
+# (duet_color #00E5FF -> &H00FFE500); dòng chẵn chưa gán không thẻ.
+avo = lyr.build_ass(VOICED, {"color": "#FF5C8A", "duet_color": "#00E5FF",
+                             "duet_female_color": "#FF5C8A",
+                             "duet_male_color": "#3B82F6"})
+dlv = dlg(avo)
+check("voice: male line gets male color tag",
+      len(dlv) >= 1 and "\\1c&H00F6823B" in dlv[0],
+      dlv[0][:140] if dlv else "")
+check("voice: female == sung color -> no extra tag",
+      len(dlv) >= 2 and "\\1c" not in dlv[1],
+      dlv[1][:140] if len(dlv) > 1 else "")
+check("voice: unassigned even line untouched",
+      len(dlv) >= 3 and "\\1c" not in dlv[2])
+check("voice: unassigned odd line keeps legacy duet color",
+      len(dlv) >= 4 and "\\1c&H00FFE500" in dlv[3],
+      dlv[3][:140] if len(dlv) > 3 else "")
+# Màu Nữ KHÁC màu chính -> dòng Nữ có thẻ màu Nữ (#FF8FB2 -> &H00B28FFF)
+avo2 = lyr.build_ass(VOICED, {"color": "#FFD400", "duet_color": "#00E5FF",
+                              "duet_female_color": "#FF8FB2",
+                              "duet_male_color": "#3B82F6"})
+dlv2 = dlg(avo2)
+check("voice: female distinct color gets female tag",
+      len(dlv2) >= 2 and "\\1c&H00B28FFF" in dlv2[1],
+      dlv2[1][:140] if len(dlv2) > 1 else "")
+# Không cấu hình song ca -> voice bị bỏ qua, không thẻ màu nào
+avo3 = lyr.build_ass(VOICED, {})
+check("voice: no duet config -> no color tags at all",
+      all("\\1c" not in x for x in dlg(avo3)))
+# assign_ends giữ voice + ok; voice lạ bị loại
+inp_v = [{"start": 5.0, "text": "B nữ", "voice": "f", "ok": True},
+         {"start": 2.0, "text": "A nam", "voice": "m", "ok": False},
+         {"start": 8.0, "text": "C lạ", "voice": "x"}]
+out_v = lyr.assign_ends(inp_v, 12.0)
+check("assign_ends: voice kept",
+      out_v[0].get("voice") == "m" and out_v[1].get("voice") == "f",
+      str(out_v))
+check("assign_ends: ok kept",
+      out_v[0].get("ok") is False and out_v[1].get("ok") is True)
+check("assign_ends: invalid voice dropped", "voice" not in out_v[2])
+
 print()
 print("FAILED:", FAILS if FAILS else "none")
 sys.exit(1 if FAILS else 0)

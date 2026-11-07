@@ -163,6 +163,14 @@ def build_ass(timed_lines, opts=None):
     play_x = _safe_int(opts.get("play_x", 1920), 1920, 240, 4000)
     play_y = _safe_int(opts.get("play_y", 1080), 1080, 240, 4000)
     duet = _ass_color(opts["duet_color"]) if opts.get("duet_color") else None
+    # Song ca theo GIỌNG TỪNG DÒNG (v4): mỗi dòng có thể gán voice 'f' (Nữ)
+    # hoặc 'm' (Nam); màu giọng lấy từ duet_female_color / duet_male_color,
+    # thiếu thì lùi về duet_color. Dòng không gán giọng giữ luật cũ (câu lẻ
+    # dùng duet_color) để tương thích ngược hoàn toàn.
+    duet_f = _ass_color(opts["duet_female_color"]) \
+        if opts.get("duet_female_color") else duet
+    duet_m = _ass_color(opts["duet_male_color"]) \
+        if opts.get("duet_male_color") else None
 
     style_fmt = (
         "[V4+ Styles]\n"
@@ -215,7 +223,7 @@ def build_ass(timed_lines, opts=None):
         words = split_words(str(ln["text"]))
         if words:
             norm.append((start, end, str(ln["text"]).strip(), words,
-                         ln.get("words")))
+                         ln.get("words"), ln.get("voice")))
 
     events = []
     if title and norm:
@@ -223,7 +231,7 @@ def build_ass(timed_lines, opts=None):
         events.append(
             f"Dialogue: 2,0:00:00.00,{_ass_time(t_end)},KaraTitle,,0,0,0,,"
             f"{{\\fad(300,400)}}{safe_text(title)}")
-    for idx, (start, end, text, words, wtimes) in enumerate(norm):
+    for idx, (start, end, text, words, wtimes, voice) in enumerate(norm):
         total_cs = max(len(words), int(round((end - start) * 100)))
         # slots: (từ, thời lượng cs, mốc bắt đầu cs tính từ đầu câu)
         slots = []
@@ -286,9 +294,18 @@ def build_ass(timed_lines, opts=None):
         body = " ".join(parts)
         if fade:
             body = "{\\fad(120,180)}" + body
-        if duet and idx % 2 == 1:
-            # Song ca: câu lẻ tô màu highlight thứ hai (màu người hát 2)
-            body = "{\\1c" + duet + "}" + body
+        # Song ca: dòng ĐÃ GÁN GIỌNG tô màu giọng đó (Nữ = duet_f, Nam =
+        # duet_m); dòng chưa gán giữ luật cũ — câu lẻ dùng màu người hát 2.
+        # Màu trùng màu hát chính thì khỏi gắn thẻ (khỏi rác ASS).
+        ov = None
+        if voice == "m" and (duet_m or duet):
+            ov = duet_m or duet
+        elif voice == "f" and duet_f:
+            ov = duet_f
+        elif voice is None and duet and idx % 2 == 1:
+            ov = duet
+        if ov and ov != sung:
+            body = "{\\1c" + ov + "}" + body
         events.append(
             f"Dialogue: 1,{_ass_time(start)},{_ass_time(end)},Kara,,0,0,0,,{body}")
         if countdown:
@@ -315,7 +332,8 @@ def assign_ends(lines, song_duration, last_extra=4.0):
     Tự sắp xếp theo giờ bắt đầu và kẹp giờ âm về 0."""
     norm = sorted(
         ({"start": max(0.0, float(ln["start"])), "text": ln["text"],
-          "end": ln.get("end"), "words": ln.get("words")} for ln in lines),
+          "end": ln.get("end"), "words": ln.get("words"),
+          "voice": ln.get("voice"), "ok": ln.get("ok")} for ln in lines),
         key=lambda x: x["start"])
     out = []
     for i, ln in enumerate(norm):
@@ -334,5 +352,9 @@ def assign_ends(lines, song_duration, last_extra=4.0):
         item = {"start": start, "end": end, "text": ln["text"]}
         if ln.get("words"):
             item["words"] = ln["words"]
+        if ln.get("voice") in ("f", "m"):
+            item["voice"] = ln["voice"]
+        if ln.get("ok") is not None:
+            item["ok"] = bool(ln["ok"])
         out.append(item)
     return out

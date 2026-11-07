@@ -4,6 +4,7 @@ Ruột xử lý chạy native trên máy (máy chủ local 127.0.0.1 + FFmpeg + 
 vỏ hiển thị ưu tiên CỬA SỔ APP RIÊNG (pywebview), không mở được mới lùi về
 trình duyệt. Đóng gói thành .exe bằng PyInstaller (xem KaraokeMaker.spec).
 """
+import glob
 import json
 import os
 import queue
@@ -11,11 +12,14 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
 import traceback
 import urllib.parse
 import uuid
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+VERSION = "4.0.0"
 
 BASE = os.path.dirname(os.path.abspath(__file__))
 if getattr(sys, "frozen", False):
@@ -27,6 +31,12 @@ else:
     ROOT = os.path.join(BASE, "work")
 WORK = os.path.join(ROOT, "session")
 os.makedirs(WORK, exist_ok=True)
+# v4: tầng DỰ ÁN — mỗi bài là một project lưu bền trong thư mục riêng.
+# Project "default" chính là phiên session cũ (thư mục WORK) để mọi luồng
+# v3 chạy y nguyên; các project khác nằm ở PROJECTS_DIR/<id>/.
+PROJECTS_DIR = os.path.join(ROOT, "projects")
+os.makedirs(PROJECTS_DIR, exist_ok=True)
+PRESETS_FILE = os.path.join(ROOT, "presets.json")
 
 sys.path.insert(0, BASE if not getattr(sys, "frozen", False) else sys._MEIPASS)
 from karaoke import lyrics as lyr  # noqa: E402
@@ -133,9 +143,17 @@ RATIOS = {"16:9": (1920, 1080), "9:16": (1080, 1920), "1:1": (1080, 1080)}
 
 def style_render_opts(style):
     """Dịch dict phong cách từ giao diện thành (style cho ASS đã gắn sẵn
-    PlayRes theo tỉ lệ khung, kích thước render, có thanh tiến trình)."""
+    PlayRes theo tỉ lệ khung, kích thước render, có thanh tiến trình).
+    style['size'] = [w, h] ghi đè tỉ lệ (hàng đợi xuất dùng cho preset 4K)."""
     st = dict(style or {})
-    size = RATIOS.get(str(st.get("ratio") or "16:9"), (1920, 1080))
+    raw_size = st.get("size")
+    if isinstance(raw_size, (list, tuple)) and len(raw_size) == 2:
+        try:
+            size = (max(16, int(raw_size[0])), max(16, int(raw_size[1])))
+        except (TypeError, ValueError):
+            size = RATIOS.get(str(st.get("ratio") or "16:9"), (1920, 1080))
+    else:
+        size = RATIOS.get(str(st.get("ratio") or "16:9"), (1920, 1080))
     st["play_x"], st["play_y"] = size
     return st, size, bool(st.get("progress_bar"))
 
@@ -235,11 +253,14 @@ def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
     if texts:
         heard = [w for s in segs for w in s["words"]]
         full = alg.align_full(heard, texts, duration)
-        raw = [{"text": t, "start": s, "words": [list(x) for x in ws]}
-               for t, s, ws in zip(texts, full["starts"], full["words"])]
+        line_ok = full.get("line_ok") or []
+        raw = [{"text": t, "start": s, "words": [list(x) for x in ws],
+                "ok": bool(line_ok[i]) if i < len(line_ok) else True}
+               for i, (t, s, ws) in enumerate(
+                   zip(texts, full["starts"], full["words"]))]
         matched, source = full["ratio"], "user"
     else:
-        raw = alg.segments_to_lines(segs)
+        raw = [{**ln, "ok": True} for ln in alg.segments_to_lines(segs)]
         matched, source = 1.0, "ai"
     if not raw:
         raise ValueError(
@@ -308,6 +329,7 @@ def _batch_public(item):
     out = {k: item[k] for k in ("id", "url", "title", "status", "progress",
                                 "label", "error")}
     out["kind"] = item.get("kind", "link")
+    out["project_id"] = item.get("project_id")
     return out
 
 
@@ -335,10 +357,9 @@ def _run_batch_item(item, opts):
             pass
         bg = resolve_bg(opts["bg"], ctx,
                         style_render_opts(opts.get("style"))[1])
-        run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
-                     opts["style"], yt_title, opts["guide"], bg,
-                     video_url=f"/api/batch/{item['id']}/video")
-        return
+        return run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
+                            opts["style"], yt_title, opts["guide"], bg,
+                            video_url=f"/api/batch/{item['id']}/video")
     from karaoke import ytdl
     fb = media.ffmpeg_bin()
     ffmpeg_dir = os.path.dirname(os.path.abspath(fb)) \
@@ -357,9 +378,9 @@ def _run_batch_item(item, opts):
     else:
         bg = resolve_bg(opts["bg"], ctx,
                         style_render_opts(opts.get("style"))[1])
-    run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
-                 opts["style"], yt_title, opts["guide"], bg,
-                 video_url=f"/api/batch/{item['id']}/video")
+    return run_pipeline(_scaled(cb, 18, 100), ctx, None, opts["sep_mode"],
+                        opts["style"], yt_title, opts["guide"], bg,
+                        video_url=f"/api/batch/{item['id']}/video")
 
 
 def _batch_worker():
@@ -371,7 +392,24 @@ def _batch_worker():
         with LOCK:
             item["status"] = "running"
         try:
-            _run_batch_item(item, opts)
+            res = _run_batch_item(item, opts)
+            # v4: bài hàng loạt xong -> thành PROJECT bền trong Thư viện
+            # (mở lại/sửa tiếp/xuất lại được). Lỗi tạo project không được
+            # làm hỏng kết quả hàng loạt.
+            try:
+                ctx = item["_ctx"]
+                pid = _materialize_project(
+                    item["title"] or "Karaoke", ctx["_work"],
+                    (res or {}).get("lines"), opts.get("style"),
+                    opts.get("bg"), opts.get("guide"),
+                    {"kind": item.get("kind", "link"),
+                     "url": item.get("url")},
+                    opts.get("sep_mode"), ctx["duration"],
+                    ctx["song_name"])
+                with LOCK:
+                    item["project_id"] = pid
+            except Exception:  # noqa: BLE001
+                traceback.print_exc()
             with LOCK:
                 item.update(status="done", progress=100.0, label="Xong")
         except Exception as e:  # noqa: BLE001
@@ -388,6 +426,434 @@ def _ensure_batch_workers():
         _BATCH_WORKERS = True
     for _ in range(BATCH_PARALLEL):
         threading.Thread(target=_batch_worker, daemon=True).start()
+
+
+# ---------------- v4: TẦNG DỰ ÁN (project) ----------------
+# Mỗi bài = 1 project: thư mục riêng chứa file làm việc + project.json
+# (tiêu đề, nguồn, dòng lời + mốc + giọng, style, nền, trạng thái). Phiên
+# session cũ chính là project "default" (thư mục WORK) — STATE luôn trỏ
+# vào project đang mở, nên toàn bộ endpoint v3 chạy y nguyên trên project
+# hiện hành; mở project khác = trỏ STATE sang thư mục của project đó.
+CURRENT = {"id": "default"}
+_PID_OK = set("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_-")
+
+
+def _project_dir(pid):
+    pid = str(pid or "")
+    if pid == "default":
+        return WORK
+    if not pid or len(pid) > 40 or any(c not in _PID_OK for c in pid):
+        raise ValueError("Mã project không hợp lệ")
+    return os.path.join(PROJECTS_DIR, pid)
+
+
+def _project_json_path(pid):
+    return os.path.join(_project_dir(pid), "project.json")
+
+
+def _load_project_json(pid):
+    """Đọc project.json -> (data, corrupt). File chưa có -> ({}, False);
+    file HỎNG (JSON gãy) -> ({}, True) để giao diện báo rõ thay vì nuốt."""
+    try:
+        with open(_project_json_path(pid), encoding="utf-8") as f:
+            data = json.load(f)
+        return (data if isinstance(data, dict) else {}), False
+    except FileNotFoundError:
+        return {}, False
+    except Exception:  # noqa: BLE001
+        return {}, True
+
+
+def _save_project_json(pid, data):
+    pdir = _project_dir(pid)
+    os.makedirs(pdir, exist_ok=True)
+    tmp = os.path.join(pdir, "project.json.tmp")
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=1)
+    os.replace(tmp, _project_json_path(pid))
+
+
+def _sanitize_lines(raw):
+    """Chuẩn hoá danh sách dòng lời từ client/lưu trữ: giữ text/start/end/
+    words/voice/ok, ép kiểu an toàn. Dòng không phải dict -> bỏ qua."""
+    out = []
+    for ln in raw or []:
+        if not isinstance(ln, dict):
+            continue
+        text = str(ln.get("text") or "")
+        start = ln.get("start")
+        if isinstance(start, bool) or not isinstance(start, (int, float)):
+            start = None
+        end = ln.get("end")
+        if isinstance(end, bool) or not isinstance(end, (int, float)):
+            end = None
+        words = None
+        if isinstance(ln.get("words"), list) and ln["words"]:
+            words = []
+            for wt in ln["words"]:
+                try:
+                    if isinstance(wt, dict):
+                        words.append([float(wt["start"]), float(wt["end"])])
+                    else:
+                        words.append([float(wt[0]), float(wt[1])])
+                except Exception:  # noqa: BLE001
+                    words = None
+                    break
+        item = {"text": text,
+                "start": None if start is None else round(float(start), 3),
+                "end": None if end is None else round(float(end), 3),
+                "words": words}
+        if ln.get("voice") in ("f", "m"):
+            item["voice"] = ln["voice"]
+        if ln.get("ok") is not None:
+            item["ok"] = bool(ln["ok"])
+        out.append(item)
+    return out[:600]
+
+
+def _lyrics_status(lines):
+    if not lines:
+        return "none"
+    if any(l.get("start") is None for l in lines):
+        return "draft"
+    return "synced"
+
+
+def _project_ctx(pid):
+    """Dựng ctx làm việc của project từ file trên đĩa + project.json."""
+    pdir = _project_dir(pid)
+    data, _corrupt = _load_project_json(pid)
+    ctx = new_ctx(pdir)
+    sw = os.path.join(pdir, "song.wav")
+    if os.path.exists(sw):
+        ctx["song_wav"] = sw
+        ctx["song_name"] = data.get("song_name")
+        dur = data.get("duration")
+        ctx["duration"] = float(dur) if isinstance(dur, (int, float)) \
+            and not isinstance(dur, bool) and dur > 0 \
+            else media.probe_duration(sw)
+    iw = os.path.join(pdir, "inst.wav")
+    if os.path.exists(iw):
+        ctx["inst_wav"] = iw
+        ctx["inst_mode"] = data.get("inst_mode")
+    for key in ("bg_image", "bg_video"):
+        hits = sorted(glob.glob(os.path.join(pdir, key + ".*")))
+        if hits:
+            ctx[key] = hits[0]
+    om = os.path.join(pdir, "karaoke.mp4")
+    if os.path.exists(om):
+        ctx["out_mp4"] = om
+    return ctx, data
+
+
+def _project_summary(pid):
+    ctx, data = _project_ctx(pid)
+    _d, corrupt = _load_project_json(pid)
+    lines = _sanitize_lines(data.get("lines") or [])
+    style = data.get("style") or {}
+    bg = data.get("bg") or {}
+    return {
+        "id": pid,
+        "title": data.get("title") or data.get("song_name")
+                 or ("Phiên làm việc hiện tại" if pid == "default"
+                     else "Dự án mới"),
+        "song_name": data.get("song_name"),
+        "duration": ctx["duration"],
+        "created": data.get("created"),
+        "updated": data.get("updated"),
+        "source_kind": (data.get("source") or {}).get("kind"),
+        "has_song": bool(ctx["song_wav"]),
+        "inst_mode": ctx["inst_mode"],
+        "ratio": str(style.get("ratio") or "16:9"),
+        "grad": bg.get("value") if bg.get("type") in (
+            "gradient", "gradient_anim") else None,
+        "status": {
+            "beat": bool(ctx["inst_wav"]),
+            "lyrics": _lyrics_status(lines),
+            "exported": bool(data.get("exported") or ctx["out_mp4"]),
+        },
+        "corrupt": corrupt,
+    }
+
+
+def _list_project_ids():
+    ids = ["default"]
+    if os.path.isdir(PROJECTS_DIR):
+        for name in sorted(os.listdir(PROJECTS_DIR)):
+            if os.path.isdir(os.path.join(PROJECTS_DIR, name)):
+                ids.append(name)
+    return ids
+
+
+def _mark_project(pid, **fields):
+    """Ghi bổ sung vào project.json — bookkeeping phụ, lỗi thì bỏ qua để
+    không bao giờ làm hỏng tác vụ chính đang chạy."""
+    try:
+        data, _c = _load_project_json(pid)
+        data.update(fields)
+        data["updated"] = time.time()
+        _save_project_json(pid, data)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def _mark_current_project(**fields):
+    _mark_project(CURRENT["id"], **fields)
+
+
+def _project_payload(pid):
+    ctx, data = _project_ctx(pid)
+    return {
+        "project": _project_summary(pid),
+        "lines": _sanitize_lines(data.get("lines") or []),
+        "style": data.get("style") or {},
+        "bg": data.get("bg") or {"type": "gradient", "value": "demtim"},
+        "guide": data.get("guide") or 0,
+        "lyrics_text": data.get("lyrics_text") or "",
+        "duration": ctx["duration"],
+        "song_name": ctx["song_name"],
+        "inst_ready": bool(ctx["inst_wav"]),
+        "has_video": bool(ctx["out_mp4"]),
+    }
+
+
+def _activate_project(pid):
+    """Mở project: trỏ STATE (phiên làm việc) sang thư mục của project.
+    Các endpoint v3 dùng STATE['_work'] nên tự chạy trên project mới."""
+    ctx, _data = _project_ctx(pid)
+    STATE.clear()
+    STATE.update(ctx)
+    CURRENT["id"] = pid
+    return _project_payload(pid)
+
+
+def _materialize_project(title, src_dir, lines, style, bg, guide, source,
+                         inst_mode, duration, song_name):
+    """Tạo project bền từ một thư mục làm việc tạm (kết quả hàng loạt):
+    chép các file cốt lõi sang thư mục project + ghi project.json."""
+    pid = uuid.uuid4().hex[:10]
+    pdir = os.path.join(PROJECTS_DIR, pid)
+    os.makedirs(pdir, exist_ok=True)
+    for fname in ("song.wav", "inst.wav", "vocal.wav", "karaoke.mp4",
+                  "lyrics.ass"):
+        src = os.path.join(src_dir, fname)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(pdir, fname))
+    for pat in ("bg_image.*", "bg_video.*"):
+        for hit in glob.glob(os.path.join(src_dir, pat)):
+            shutil.copyfile(hit, os.path.join(pdir, os.path.basename(hit)))
+    now = time.time()
+    data = {"id": pid, "title": title, "song_name": song_name,
+            "duration": duration, "inst_mode": inst_mode,
+            "lines": _sanitize_lines(lines or []),
+            "style": style or {}, "bg": bg or {}, "guide": guide or 0,
+            "source": source or {}, "exported": True,
+            "created": now, "updated": now}
+    _save_project_json(pid, data)
+    return pid
+
+
+def _compute_peaks(audio_path, n):
+    """Peaks waveform: giải mã mono 22050Hz bằng ffmpeg rồi lấy biên độ
+    cực đại từng bucket, chuẩn hoá 0..1. File im lặng -> toàn 0 (không
+    sập); file ngắn -> ít mẫu vẫn chia bucket bình thường."""
+    import numpy as np
+    n = max(24, min(int(n or 240), 1200))
+    cmd = [media.ffmpeg_bin(), "-v", "error", "-i", audio_path,
+           "-ac", "1", "-ar", "22050", "-f", "s16le", "-"]
+    r = subprocess.run(cmd, capture_output=True, timeout=180,
+                       **media.no_window_kwargs())
+    if r.returncode != 0 or not r.stdout:
+        return []
+    a = np.abs(np.frombuffer(r.stdout, dtype="<i2").astype(np.float32)
+               / 32768.0)
+    if a.size == 0:
+        return []
+    n = min(n, int(a.size))
+    edges = np.linspace(0, a.size, n + 1).astype(int)
+    peaks = [float(a[edges[i]:edges[i + 1]].max())
+             if edges[i + 1] > edges[i] else 0.0 for i in range(n)]
+    top = max(peaks) if peaks else 0.0
+    if top > 0:
+        peaks = [p / top for p in peaks]
+    return [round(p, 3) for p in peaks]
+
+
+def _project_peaks(pid, src_kind, n):
+    """Peaks của project (src: song|inst), cache theo mtime+size+n."""
+    ctx, _data = _project_ctx(pid)
+    path = ctx["inst_wav"] if src_kind == "inst" else ctx["song_wav"]
+    if not path or not os.path.exists(path):
+        return None
+    n = max(24, min(int(n or 240), 1200))
+    st = os.stat(path)
+    key = f"{st.st_mtime_ns}:{st.st_size}:{n}:{src_kind}"
+    cache = os.path.join(ctx["_work"], f"peaks_{src_kind}_{n}.json")
+    try:
+        with open(cache, encoding="utf-8") as f:
+            saved = json.load(f)
+        if saved.get("key") == key:
+            return {"duration": ctx["duration"],
+                    "peaks": saved.get("peaks") or []}
+    except Exception:  # noqa: BLE001
+        pass
+    peaks = _compute_peaks(path, n)
+    try:
+        with open(cache, "w", encoding="utf-8") as f:
+            json.dump({"key": key, "peaks": peaks}, f)
+    except Exception:  # noqa: BLE001
+        pass
+    return {"duration": ctx["duration"], "peaks": peaks}
+
+
+# ---------------- v4: MẪU CẤU HÌNH (preset) ----------------
+
+def _load_presets():
+    try:
+        with open(PRESETS_FILE, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, list) else []
+    except Exception:  # noqa: BLE001
+        return []
+
+
+def _save_presets(items):
+    with open(PRESETS_FILE, "w", encoding="utf-8") as f:
+        json.dump(items, f, ensure_ascii=False, indent=1)
+
+
+# ---------------- v4: HÀNG ĐỢI XUẤT (export queue) ----------------
+# Khác hàng loạt (batch = làm trọn quy trình từ link/file): hàng đợi xuất
+# chỉ RENDER các project đã có lời, lần lượt từng bài, lưu thẳng file ra
+# thư mục đích với preset định dạng/encoder/chất lượng đã chọn.
+EXPORT_FORMATS = {
+    "yt": {"label": "YouTube · 16:9", "ratio": "16:9",
+           "size": (1920, 1080)},
+    "shorts": {"label": "Shorts / TikTok · 9:16", "ratio": "9:16",
+               "size": (1080, 1920)},
+    "fb": {"label": "Facebook · 1:1", "ratio": "1:1",
+           "size": (1080, 1080)},
+    "yt4k": {"label": "YouTube 4K · 16:9", "ratio": "16:9",
+             "size": (3840, 2160)},
+}
+QUALITY_KBPS = {"cao": 16000, "vua": 10000, "thap": 6000}
+EXPORTQ = {}
+EXPORTQ_ORDER = []
+EXPORT_QUEUE = queue.Queue()
+_EXPORT_WORKER = False
+
+
+def _export_public(it):
+    return {k: it.get(k) for k in (
+        "id", "project_id", "title", "format", "status", "progress",
+        "label", "error", "saved_path", "size_bytes", "encoder")}
+
+
+def _resolve_encoder(want):
+    if want == "nvenc":
+        return "nvenc"
+    if want == "cpu":
+        return "cpu"
+    return "nvenc" if media.has_nvenc() else "cpu"
+
+
+def _run_export_item(item):
+    cfg = item["config"]
+    pid = item["project_id"]
+    ctx, data = _project_ctx(pid)
+    if not ctx["song_wav"]:
+        raise ValueError("Project chưa có bài hát")
+    lines = _sanitize_lines(data.get("lines") or [])
+    if not lines:
+        raise ValueError("Project chưa có lời — mở Studio căn lời trước")
+    missing = sum(1 for l in lines if l.get("start") is None)
+    if missing:
+        raise ValueError(f"Còn {missing} câu chưa căn nhịp — mở Studio "
+                         "căn nốt trước khi xuất")
+    duration = ctx["duration"]
+    if duration <= 0:
+        raise ValueError("Không đọc được thời lượng bài hát")
+    timed = lyr.assign_ends(lines, duration)
+    style = dict(data.get("style") or {})
+    fmt = EXPORT_FORMATS[cfg["format"]]
+    style["ratio"] = fmt["ratio"]
+    style["size"] = list(fmt["size"])
+    st, size, bar = style_render_opts(style)
+    pdir = ctx["_work"]
+    ass_path = os.path.join(pdir, "lyrics.ass")
+    with open(ass_path, "w", encoding="utf-8") as f:
+        f.write(lyr.build_ass(timed, st))
+    bg = resolve_bg(data.get("bg") or {"type": "gradient", "value": "demtim"},
+                    ctx, size)
+    audio = ctx["inst_wav"] or ctx["song_wav"]
+    try:
+        guide = float(data.get("guide") or 0)
+    except (TypeError, ValueError):
+        guide = 0.0
+    if ctx["inst_wav"] and guide > 0:
+        mixed = os.path.join(pdir, "mixed.wav")
+        media.mix_with_guide(ctx["inst_wav"], ctx["song_wav"], guide, mixed)
+        audio = mixed
+    out_dir = str(cfg.get("out_dir") or SAVE_DIR)
+    os.makedirs(out_dir, exist_ok=True)
+    base = _safe_name(cfg.get("filename") or item["title"], "karaoke")
+    out_mp4 = os.path.join(out_dir, base + ".mp4")
+    k = 2
+    while os.path.exists(out_mp4):
+        out_mp4 = os.path.join(out_dir, f"{base} ({k}).mp4")
+        k += 1
+
+    def cb(p, label=""):
+        with LOCK:
+            item["progress"] = round(float(p), 1)
+            if label:
+                item["label"] = label
+    used = media.render_video(
+        bg, audio, ass_path if cfg.get("burn", True) else None,
+        out_mp4, duration, cb, size=size, progress_bar=bar,
+        encoder=_resolve_encoder(cfg.get("encoder") or "auto"),
+        bitrate_k=QUALITY_KBPS.get(cfg.get("quality") or "cao"),
+        bg_blur=style.get("bg_blur") or 0)
+    if cfg.get("export_ass"):
+        shutil.copyfile(ass_path, os.path.splitext(out_mp4)[0] + ".ass")
+    proj_mp4 = os.path.join(pdir, "karaoke.mp4")
+    if os.path.abspath(out_mp4) != os.path.abspath(proj_mp4):
+        shutil.copyfile(out_mp4, proj_mp4)
+    if CURRENT["id"] == pid:
+        STATE["out_mp4"] = proj_mp4
+    _mark_project(pid, exported=True,
+                  last_export={"file": out_mp4, "encoder": used,
+                               "at": time.time()})
+    item.update(saved_path=out_mp4,
+                size_bytes=os.path.getsize(out_mp4), encoder=used)
+
+
+def _export_worker():
+    while True:
+        iid = EXPORT_QUEUE.get()
+        item = EXPORTQ.get(iid)
+        if item is None:
+            continue
+        with LOCK:
+            item.update(status="running", progress=0.0,
+                        label="Đang xuất...")
+        try:
+            _run_export_item(item)
+            with LOCK:
+                item.update(status="done", progress=100.0, label="Xong")
+        except Exception as e:  # noqa: BLE001
+            traceback.print_exc()
+            with LOCK:
+                item.update(status="error", error=str(e))
+
+
+def _ensure_export_worker():
+    global _EXPORT_WORKER
+    with LOCK:
+        if _EXPORT_WORKER:
+            return
+        _EXPORT_WORKER = True
+    threading.Thread(target=_export_worker, daemon=True).start()
 
 
 def serve_file(handler, path, content_type, download_name=None):
@@ -530,6 +996,73 @@ class Handler(BaseHTTPRequestHandler):
                     serve_file(self, out, "video/mp4")
                 else:
                     self._json({"error": "not found"}, 404)
+            elif path == "/api/app-info":
+                self._json({"version": VERSION, "save_dir": SAVE_DIR,
+                            "current_project": CURRENT["id"]})
+            elif path == "/api/projects":
+                items = []
+                for pid in _list_project_ids():
+                    try:
+                        items.append(_project_summary(pid))
+                    except Exception:  # noqa: BLE001
+                        items.append({"id": pid, "title": pid,
+                                      "corrupt": True,
+                                      "status": {"beat": False,
+                                                 "lyrics": "none",
+                                                 "exported": False}})
+                items.sort(key=lambda x: -(x.get("updated") or 0))
+                try:
+                    du = shutil.disk_usage(ROOT)
+                    storage = {"total": du.total, "free": du.free}
+                except Exception:  # noqa: BLE001
+                    storage = {"total": 0, "free": 0}
+                used = 0
+                for pid in _list_project_ids():
+                    try:
+                        pdir = _project_dir(pid)
+                        for f in glob.glob(os.path.join(pdir, "*")):
+                            if os.path.isfile(f):
+                                used += os.path.getsize(f)
+                    except Exception:  # noqa: BLE001
+                        pass
+                storage["projects_bytes"] = used
+                self._json({"items": items, "storage": storage,
+                            "current": CURRENT["id"]})
+            elif path == "/api/project/current":
+                self._json(_project_payload(CURRENT["id"]))
+            elif path.startswith("/api/projects/") and \
+                    path.endswith("/peaks"):
+                parts = path.split("/")
+                pid = parts[3] if len(parts) == 5 else None
+                qs = urllib.parse.parse_qs(parsed.query)
+                src = (qs.get("src") or ["song"])[0]
+                try:
+                    n = int((qs.get("n") or ["240"])[0])
+                except ValueError:
+                    n = 240
+                try:
+                    res = _project_peaks(pid, src, n) if pid else None
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                if res is None:
+                    return self._json(
+                        {"error": "Project chưa có file nhạc để vẽ sóng"},
+                        404)
+                self._json(res)
+            elif path == "/api/presets":
+                self._json({"items": _load_presets()})
+            elif path == "/api/export/info":
+                self._json({"nvenc": media.has_nvenc(),
+                            "gpu": media.gpu_name(),
+                            "formats": {k: {"label": v["label"],
+                                            "size": list(v["size"])}
+                                        for k, v in EXPORT_FORMATS.items()},
+                            "save_dir": SAVE_DIR})
+            elif path == "/api/export/queue":
+                with LOCK:
+                    items = [_export_public(EXPORTQ[i])
+                             for i in EXPORTQ_ORDER if i in EXPORTQ]
+                self._json({"items": items})
             else:
                 self._json({"error": "not found"}, 404)
         except BrokenPipeError:
@@ -549,10 +1082,13 @@ class Handler(BaseHTTPRequestHandler):
                 name = urllib.parse.unquote(
                     self.headers.get("X-File-Name") or "song.bin")
                 ext = os.path.splitext(name)[1] or ".bin"
-                src = os.path.join(WORK, "song_src" + ext)
+                src = os.path.join(STATE["_work"], "song_src" + ext)
                 with open(src, "wb") as f:
                     f.write(payload)
                 dur = _load_song_file(STATE, src, name)
+                _mark_current_project(song_name=name, duration=dur,
+                                      title=None, lines=[], lyrics_text="",
+                                      exported=False, inst_mode=None)
                 self._json({"ok": True, "name": name, "duration": dur})
 
             elif path in ("/api/upload-bg-image", "/api/upload-bg-video"):
@@ -563,7 +1099,7 @@ class Handler(BaseHTTPRequestHandler):
                     self.headers.get("X-File-Name") or "bg.bin")
                 ext = os.path.splitext(name)[1] or ".bin"
                 key = "bg_image" if path.endswith("image") else "bg_video"
-                dst = os.path.join(WORK, key + ext)
+                dst = os.path.join(STATE["_work"], key + ext)
                 with open(dst, "wb") as f:
                     f.write(payload)
                 if not media.check_readable(dst):
@@ -579,7 +1115,7 @@ class Handler(BaseHTTPRequestHandler):
                     return self._json({"error": "Chưa có bài hát"}, 400)
                 mode = (self._body_json() or {}).get("mode", "ai")
                 song_wav, duration = STATE["song_wav"], STATE["duration"]
-                out = os.path.join(WORK, "inst.wav")
+                out = os.path.join(STATE["_work"], "inst.wav")
 
                 def job(cb):
                     if mode == "fast":
@@ -587,6 +1123,7 @@ class Handler(BaseHTTPRequestHandler):
                     else:
                         mdx.separate_mdx(song_wav, out, progress_cb=cb)
                     STATE.update(inst_wav=out, inst_mode=mode)
+                    _mark_current_project(inst_mode=mode)
                     return {"mode": mode}
                 if any_job_running():
                     return self._json(
@@ -629,10 +1166,13 @@ class Handler(BaseHTTPRequestHandler):
                     heard = alg.transcribe_words(song_wav, duration, cb,
                                                   models_dir)
                     full = alg.align_full(heard, texts, duration)
+                    line_ok = full.get("line_ok") or []
                     lines = [{"text": t, "start": s,
-                              "words": [list(x) for x in ws]}
-                             for t, s, ws in zip(texts, full["starts"],
-                                                 full["words"])]
+                              "words": [list(x) for x in ws],
+                              "ok": bool(line_ok[i]) if i < len(line_ok)
+                                    else True}
+                             for i, (t, s, ws) in enumerate(
+                                 zip(texts, full["starts"], full["words"]))]
                     return {"lines": lines, "matched": full["ratio"],
                             "heard": len(heard)}
                 if any_job_running():
@@ -674,22 +1214,26 @@ class Handler(BaseHTTPRequestHandler):
                         {"error": "Không đọc được thời lượng bài hát"}, 400)
                 timed = lyr.assign_ends(lines, duration)
                 st, size, bar = style_render_opts(style)
-                ass_path = os.path.join(WORK, "lyrics.ass")
+                workdir = STATE["_work"]
+                ass_path = os.path.join(workdir, "lyrics.ass")
                 with open(ass_path, "w", encoding="utf-8") as f:
                     f.write(lyr.build_ass(timed, st))
                 bg = self._resolve_bg(bg_req, style)
-                out_mp4 = os.path.join(WORK, "karaoke.mp4")
+                out_mp4 = os.path.join(workdir, "karaoke.mp4")
                 song_wav = STATE["song_wav"]
+                _mark_current_project(lines=_sanitize_lines(lines),
+                                      style=style, bg=bg_req, guide=guide)
 
                 def job(cb):
                     audio = base_audio
                     if use_inst and guide > 0:
-                        mixed = os.path.join(WORK, "mixed.wav")
+                        mixed = os.path.join(workdir, "mixed.wav")
                         media.mix_with_guide(base_audio, song_wav, guide, mixed)
                         audio = mixed
                     media.render_video(bg, audio, ass_path, out_mp4, duration,
                                        cb, size=size, progress_bar=bar)
                     STATE["out_mp4"] = out_mp4
+                    _mark_current_project(exported=True)
                     return {"video": "/api/video"}
                 if any_job_running():
                     return self._json(
@@ -731,8 +1275,13 @@ class Handler(BaseHTTPRequestHandler):
                         {"error": "Không đọc được thời lượng bài hát"}, 400)
 
                 def job(cb):
-                    return run_pipeline(cb, STATE, texts, sep_mode, style,
-                                        title, guide, bg)
+                    res = run_pipeline(cb, STATE, texts, sep_mode, style,
+                                       title, guide, bg)
+                    _mark_current_project(
+                        lines=_sanitize_lines(res.get("lines")),
+                        style=style, bg=req.get("bg"), guide=guide,
+                        inst_mode=sep_mode, exported=True)
+                    return res
                 if any_job_running():
                     return self._json(
                         {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
@@ -778,18 +1327,26 @@ class Handler(BaseHTTPRequestHandler):
 
                 def job(cb):
                     src, yt_title, video_path = ytdl.download(
-                        url, WORK, _scaled(cb, 2, 16), want_video, ffmpeg_dir)
+                        url, STATE["_work"], _scaled(cb, 2, 16), want_video,
+                        ffmpeg_dir)
                     dur = _load_song_file(STATE, src, yt_title)
                     if dur <= 0:
                         raise ValueError(
                             "File tải về không đọc được tiếng — thử link khác")
+                    _mark_current_project(song_name=yt_title, duration=dur,
+                                          title=None, exported=False)
                     if video_path:
                         STATE["bg_video"] = video_path
                     bg = ({"type": "video", "value": video_path}
                           if video_path else fallback_bg)
-                    return run_pipeline(_scaled(cb, 18, 100), STATE, texts,
-                                        sep_mode, style,
-                                        title_req or yt_title, guide, bg)
+                    res = run_pipeline(_scaled(cb, 18, 100), STATE, texts,
+                                       sep_mode, style,
+                                       title_req or yt_title, guide, bg)
+                    _mark_current_project(
+                        lines=_sanitize_lines(res.get("lines")),
+                        style=style, guide=guide, inst_mode=sep_mode,
+                        exported=True)
+                    return res
                 if any_job_running():
                     return self._json(
                         {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
@@ -939,6 +1496,300 @@ class Handler(BaseHTTPRequestHandler):
                         pass
                 self._json({"ok": True, "path": SAVE_DIR})
 
+            # ---------- v4: PROJECT ----------
+            elif path == "/api/projects":
+                req = self._body_json()
+                title = str(req.get("title") or "").strip()[:120]
+                pid = uuid.uuid4().hex[:10]
+                now = time.time()
+                _save_project_json(pid, {
+                    "id": pid, "title": title or None, "lines": [],
+                    "style": req.get("style") or {},
+                    "bg": req.get("bg") or {"type": "gradient",
+                                             "value": "demtim"},
+                    "source": {"kind": "empty"}, "exported": False,
+                    "created": now, "updated": now})
+                self._json({"project": _project_summary(pid)})
+
+            elif path == "/api/projects/import-file":
+                payload = self._body()
+                if not payload:
+                    return self._json(
+                        {"error": "File rỗng — chưa chọn file nhạc?"}, 400)
+                name = urllib.parse.unquote(
+                    self.headers.get("X-File-Name") or "song.bin")
+                pid = uuid.uuid4().hex[:10]
+                pdir = os.path.join(PROJECTS_DIR, pid)
+                os.makedirs(pdir, exist_ok=True)
+                ext = os.path.splitext(name)[1] or ".bin"
+                src = os.path.join(pdir, "song_src" + ext)
+                with open(src, "wb") as f:
+                    f.write(payload)
+                ctx = new_ctx(pdir)
+                try:
+                    dur = _load_song_file(ctx, src, name)
+                    if dur <= 0:
+                        raise ValueError("File không đọc được tiếng")
+                except Exception as e:  # noqa: BLE001
+                    shutil.rmtree(pdir, ignore_errors=True)
+                    return self._json({"error": str(e)}, 400)
+                now = time.time()
+                _save_project_json(pid, {
+                    "id": pid, "title": None, "song_name": name,
+                    "duration": dur, "inst_mode": None, "lines": [],
+                    "style": {}, "bg": {"type": "gradient",
+                                        "value": "demtim"},
+                    "source": {"kind": "file", "name": name},
+                    "exported": False, "created": now, "updated": now})
+                self._json({"project": _project_summary(pid)})
+
+            elif path == "/api/projects/import-link":
+                req = self._body_json()
+                from karaoke import ytdl
+                url = str(req.get("url") or "").strip()
+                try:
+                    url = ytdl.canonical_url(url)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                want_video = bool(req.get("want_video"))
+                sep_mode = "fast" if req.get("sep_mode") == "fast" else "ai"
+                style = req.get("style") or {}
+                bg_req = req.get("bg") or {"type": "gradient",
+                                           "value": "demtim"}
+                pid = uuid.uuid4().hex[:10]
+                pdir = os.path.join(PROJECTS_DIR, pid)
+                ctx = new_ctx(pdir)
+                now = time.time()
+                _save_project_json(pid, {
+                    "id": pid, "title": None, "lines": [], "style": style,
+                    "bg": bg_req, "source": {"kind": "link", "url": url},
+                    "exported": False, "created": now, "updated": now})
+                fb = media.ffmpeg_bin()
+                ffmpeg_dir = os.path.dirname(os.path.abspath(fb)) \
+                    if os.path.sep in fb else None
+
+                def job(cb):
+                    src, yt_title, video_path = ytdl.download(
+                        url, pdir, _scaled(cb, 2, 16), want_video, ffmpeg_dir)
+                    dur = _load_song_file(ctx, src, yt_title)
+                    if dur <= 0:
+                        raise ValueError(
+                            "File tải về không đọc được tiếng — thử link khác")
+                    if video_path:
+                        ctx["bg_video"] = video_path
+                        bg = {"type": "video", "value": video_path}
+                    else:
+                        bg = resolve_bg(bg_req, ctx,
+                                        style_render_opts(style)[1])
+                    res = run_pipeline(_scaled(cb, 18, 100), ctx, None,
+                                       sep_mode, style, yt_title, 0, bg)
+                    _mark_project(pid, song_name=yt_title, duration=dur,
+                                  lines=_sanitize_lines(res.get("lines")),
+                                  inst_mode=sep_mode, exported=True)
+                    return {"project": pid, "title": yt_title}
+                jid = new_job(job)
+                self._json({"job": jid, "project": pid})
+
+            elif path.startswith("/api/projects/") and \
+                    path.endswith("/open"):
+                parts = path.split("/")
+                pid = parts[3] if len(parts) == 5 else None
+                try:
+                    pdir = _project_dir(pid) if pid else None
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                if not pdir or not os.path.isdir(pdir):
+                    return self._json({"error": "Không thấy project"}, 404)
+                _d, corrupt = _load_project_json(pid)
+                if corrupt:
+                    return self._json(
+                        {"error": "File project.json của project này bị "
+                                  "hỏng — không mở được"}, 400)
+                if any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong rồi "
+                                  "mở project khác"}, 409)
+                self._json(_activate_project(pid))
+
+            elif path == "/api/project/current":
+                req = self._body_json()
+                data, corrupt = _load_project_json(CURRENT["id"])
+                if corrupt:
+                    return self._json(
+                        {"error": "project.json của project đang mở bị "
+                                  "hỏng — không lưu được"}, 400)
+                if "title" in req:
+                    data["title"] = str(req["title"] or "").strip()[:120] \
+                        or None
+                if "lines" in req:
+                    data["lines"] = _sanitize_lines(req["lines"])
+                if isinstance(req.get("style"), dict):
+                    data["style"] = req["style"]
+                if isinstance(req.get("bg"), dict):
+                    data["bg"] = req["bg"]
+                if "guide" in req:
+                    try:
+                        data["guide"] = max(0.0, min(
+                            40.0, float(req["guide"])))
+                    except (TypeError, ValueError):
+                        pass
+                if "lyrics_text" in req:
+                    data["lyrics_text"] = str(req["lyrics_text"])[:100000]
+                data["updated"] = time.time()
+                _save_project_json(CURRENT["id"], data)
+                self._json({"ok": True, "updated": data["updated"]})
+
+            elif path.startswith("/api/projects/") and \
+                    path.endswith("/delete"):
+                parts = path.split("/")
+                pid = parts[3] if len(parts) == 5 else None
+                if pid == "default":
+                    return self._json(
+                        {"error": "Không xoá được project mặc định"}, 400)
+                try:
+                    pdir = _project_dir(pid) if pid else None
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                if not pdir or not os.path.isdir(pdir):
+                    return self._json({"error": "Không thấy project"}, 404)
+                if CURRENT["id"] == pid:
+                    _activate_project("default")
+                shutil.rmtree(pdir, ignore_errors=True)
+                self._json({"ok": True})
+
+            elif path.startswith("/api/projects/") and \
+                    path.endswith("/separate"):
+                parts = path.split("/")
+                pid = parts[3] if len(parts) == 5 else None
+                try:
+                    pdir = _project_dir(pid) if pid else None
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                if not pdir or not os.path.isdir(pdir):
+                    return self._json({"error": "Không thấy project"}, 404)
+                if pid == CURRENT["id"] and any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong đã"},
+                        409)
+                mode = (self._body_json() or {}).get("mode", "ai")
+                ctx, _data = _project_ctx(pid)
+                if not ctx["song_wav"]:
+                    return self._json(
+                        {"error": "Project chưa có bài hát"}, 400)
+                song_wav, duration = ctx["song_wav"], ctx["duration"]
+                out = os.path.join(pdir, "inst.wav")
+
+                def job(cb):
+                    if mode == "fast":
+                        media.center_cut(song_wav, out, cb, duration)
+                    else:
+                        mdx.separate_mdx(song_wav, out, progress_cb=cb)
+                    if CURRENT["id"] == pid:
+                        STATE.update(inst_wav=out, inst_mode=mode)
+                    _mark_project(pid, inst_mode=mode)
+                    return {"mode": mode}
+                jid = new_job(job)
+                self._json({"job": jid})
+
+            # ---------- v4: PRESET + HÀNG ĐỢI XUẤT ----------
+            elif path == "/api/presets":
+                req = self._body_json()
+                name = str(req.get("name") or "").strip()[:60]
+                if not name:
+                    return self._json({"error": "Chưa đặt tên mẫu"}, 400)
+                items = [p for p in _load_presets()
+                         if p.get("name") != name]
+                items.append({"name": name,
+                              "style": req.get("style") or {},
+                              "bg": req.get("bg") or {},
+                              "export": req.get("export") or {},
+                              "saved_at": time.time()})
+                _save_presets(items)
+                self._json({"ok": True, "items": items})
+
+            elif path == "/api/presets/delete":
+                name = str((self._body_json() or {}).get("name") or "")
+                items = [p for p in _load_presets()
+                         if p.get("name") != name]
+                _save_presets(items)
+                self._json({"ok": True, "items": items})
+
+            elif path == "/api/export/queue":
+                req = self._body_json()
+                pid = str(req.get("project_id") or CURRENT["id"])
+                try:
+                    pdir = _project_dir(pid)
+                except ValueError as e:
+                    return self._json({"error": str(e)}, 400)
+                if not os.path.isdir(pdir):
+                    return self._json({"error": "Không thấy project"}, 404)
+                _d, corrupt = _load_project_json(pid)
+                if corrupt:
+                    return self._json(
+                        {"error": "project.json của project này bị hỏng"},
+                        400)
+                ctx, data = _project_ctx(pid)
+                if not ctx["song_wav"]:
+                    return self._json(
+                        {"error": "Project chưa có bài hát"}, 400)
+                qlines = _sanitize_lines(data.get("lines") or [])
+                if not qlines:
+                    return self._json(
+                        {"error": "Project chưa có lời — mở Studio căn "
+                                  "lời trước"}, 400)
+                miss = sum(1 for l in qlines if l.get("start") is None)
+                if miss:
+                    return self._json(
+                        {"error": f"Còn {miss} câu chưa căn nhịp — mở "
+                                  "Studio căn nốt trước khi xuất"}, 400)
+                cfg_in = req.get("config") or {}
+                config = {
+                    "format": cfg_in.get("format")
+                              if cfg_in.get("format") in EXPORT_FORMATS
+                              else "yt",
+                    "encoder": cfg_in.get("encoder")
+                               if cfg_in.get("encoder") in (
+                                   "auto", "nvenc", "cpu") else "auto",
+                    "quality": cfg_in.get("quality")
+                               if cfg_in.get("quality") in QUALITY_KBPS
+                               else "cao",
+                    "burn": bool(cfg_in.get("burn", True)),
+                    "export_ass": bool(cfg_in.get("export_ass")),
+                    "out_dir": str(cfg_in.get("out_dir") or SAVE_DIR),
+                    "filename": str(cfg_in.get("filename") or ""),
+                }
+                summary = _project_summary(pid)
+                iid = uuid.uuid4().hex[:10]
+                item = {"id": iid, "project_id": pid,
+                        "title": summary["title"],
+                        "format": EXPORT_FORMATS[config["format"]]["label"],
+                        "status": "queued", "progress": 0.0, "label": "",
+                        "error": None, "saved_path": None,
+                        "size_bytes": None, "encoder": None,
+                        "config": config}
+                with LOCK:
+                    EXPORTQ[iid] = item
+                    EXPORTQ_ORDER.append(iid)
+                _ensure_export_worker()
+                EXPORT_QUEUE.put(iid)
+                self._json({"item": iid})
+
+            elif path.startswith("/api/export/queue/") and \
+                    path.endswith("/remove"):
+                parts = path.split("/")
+                iid = parts[4] if len(parts) == 6 else None
+                item = EXPORTQ.get(iid) if iid else None
+                if not item:
+                    return self._json({"error": "Không thấy mục xuất"}, 404)
+                if item["status"] == "running":
+                    return self._json(
+                        {"error": "Đang xuất dở — không gỡ được"}, 409)
+                with LOCK:
+                    EXPORTQ.pop(iid, None)
+                    if iid in EXPORTQ_ORDER:
+                        EXPORTQ_ORDER.remove(iid)
+                self._json({"ok": True})
+
             else:
                 self._json({"error": "not found"}, 404)
         except BrokenPipeError:
@@ -952,7 +1803,7 @@ def main():
     server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
     port = server.server_address[1]
     url = f"http://127.0.0.1:{port}/"
-    print(f"Karaoke Maker đang chạy tại {url}", flush=True)
+    print(f"Karaoke Maker {VERSION} đang chạy tại {url}", flush=True)
     if os.environ.get("KARAOKE_NO_BROWSER") == "1":
         try:
             server.serve_forever()
@@ -965,8 +1816,9 @@ def main():
     try:
         import webview
         threading.Thread(target=server.serve_forever, daemon=True).start()
-        webview.create_window("Karaoke Maker — làm video karaoke", url,
-                              width=1280, height=860, min_size=(960, 640))
+        webview.create_window(f"Karaoke Maker {VERSION} — làm video karaoke",
+                              url, width=1360, height=900,
+                              min_size=(1024, 680))
         webview.start()
         return
     except Exception:  # noqa: BLE001

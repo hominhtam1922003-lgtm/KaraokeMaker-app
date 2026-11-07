@@ -164,9 +164,13 @@ def align_full(heard, line_texts, duration=0.0):
         return s, s + 0.25
 
     words_out, pos = [], 0
+    line_ok = []
     for li, ws in enumerate(line_words):
         row = []
+        direct = False
         for k in range(len(ws)):
+            if pos + k in mapping:
+                direct = True
             s, e = word_time(pos + k)
             s = max(s, starts[li])
             if row:
@@ -174,8 +178,13 @@ def align_full(heard, line_texts, duration=0.0):
             e = max(e, s + 0.05)
             row.append((round(s, 2), round(e, 2)))
         words_out.append(row)
+        # line_ok: câu có ÍT NHẤT một từ khớp trực tiếp với bản nghe. Câu
+        # toàn nội suy = "chưa khớp" — Studio (v4) gắn cảnh báo để người
+        # dùng soát lại/gắn nhịp tay câu đó thay vì tin mù.
+        line_ok.append(direct)
         pos += len(ws)
-    return {"starts": starts, "ratio": round(ratio, 3), "words": words_out}
+    return {"starts": starts, "ratio": round(ratio, 3), "words": words_out,
+            "line_ok": line_ok}
 
 
 # ---------------- Whisper ----------------

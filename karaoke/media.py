@@ -229,25 +229,90 @@ def mix_with_guide(inst_wav, orig_wav, guide_pct, out_wav):
     _run(cmd, label="trộn giọng dẫn")
 
 
+_NVENC_CACHE = {}
+
+
+def has_nvenc():
+    """True nếu máy mã hoá được bằng h264_nvenc THẬT (không chỉ liệt kê
+    encoder — máy không có GPU NVIDIA vẫn có thể có tên encoder trong danh
+    sách). Đo bằng cách mã hoá thử 15 khung; kết quả cache cho cả phiên."""
+    if "ok" in _NVENC_CACHE:
+        return _NVENC_CACHE["ok"]
+    ok = False
+    try:
+        cmd = [ffmpeg_bin(), "-v", "error", "-f", "lavfi", "-i",
+               "color=c=black:s=256x256:r=30", "-frames:v", "15",
+               "-c:v", "h264_nvenc", "-f", "null", "-"]
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30,
+                           **no_window_kwargs())
+        ok = r.returncode == 0
+    except Exception:  # noqa: BLE001
+        ok = False
+    _NVENC_CACHE["ok"] = ok
+    return ok
+
+
+def gpu_name():
+    """Tên GPU NVIDIA (nvidia-smi) — chỉ để HIỂN THỊ nhãn, lỗi thì rỗng."""
+    try:
+        r = subprocess.run(
+            ["nvidia-smi", "--query-gpu=name", "--format=csv,noheader"],
+            capture_output=True, text=True, timeout=10, **no_window_kwargs())
+        names = (r.stdout or "").strip().splitlines()
+        return names[0].strip() if names else ""
+    except Exception:  # noqa: BLE001
+        return ""
+
+
+def _vcodec_args(enc, bitrate_k):
+    """Tham số encoder video: 'nvenc' (GPU) hoặc 'cpu' (libx264).
+    bitrate_k=None -> chế độ chất lượng (CRF/CQ như bản cũ)."""
+    if enc == "nvenc":
+        args = ["-c:v", "h264_nvenc", "-preset", "p5"]
+        if bitrate_k:
+            args += ["-b:v", f"{int(bitrate_k)}k"]
+        else:
+            args += ["-rc", "vbr", "-cq", "20", "-b:v", "0"]
+        return args
+    args = ["-c:v", "libx264", "-preset", "medium"]
+    if bitrate_k:
+        bk = int(bitrate_k)
+        args += ["-b:v", f"{bk}k", "-maxrate", f"{bk}k",
+                 "-bufsize", f"{bk * 2}k"]
+    else:
+        args += ["-crf", "20"]
+    return args
+
+
 def render_video(bg, audio_wav, ass_path, out_mp4, duration, progress_cb=None,
-                 size=(1920, 1080), progress_bar=False):
+                 size=(1920, 1080), progress_bar=False, encoder="cpu",
+                 bitrate_k=None, bg_blur=0):
     """bg: {'type': 'color'|'image'|'video', 'value': hex hoặc đường dẫn}.
     Đốt chữ ASS karaoke lên nền theo size (mặc định 1920x1080; có thể là
-    dọc 1080x1920 / vuông 1080x1080), nhạc là audio_wav. progress_bar:
-    vẽ thanh tiến trình mảnh ở mép trên video (kiểu Youka)."""
+    dọc 1080x1920 / vuông 1080x1080 / 4K 3840x2160), nhạc là audio_wav.
+    progress_bar: vẽ thanh tiến trình mảnh ở mép trên video (kiểu Youka).
+    ass_path=None -> KHÔNG đốt chữ (xuất video nền + nhạc trơn).
+    encoder: 'cpu' (libx264) | 'nvenc' (GPU NVIDIA; sập thì tự lùi về CPU).
+    bitrate_k: giới hạn bitrate video (kbps) — None = chất lượng CRF/CQ.
+    bg_blur: 0-100, làm mờ nền ảnh/video (gblur).
+    Trả về encoder THẬT đã dùng: 'nvenc' hoặc 'cpu'."""
     ff = ffmpeg_bin()
     w, h = int(size[0]), int(size[1])
     if bg.get("type") in ("image", "video") and not check_readable(bg.get("value") or ""):
         raise RuntimeError("File nền không đọc được — hãy chọn file khác")
+    blur = ""
+    if bg_blur and bg.get("type") in ("image", "video"):
+        sigma = max(1.0, min(50.0, float(bg_blur) / 2.0))
+        blur = f"gblur=sigma={sigma:.1f},"
     cmd = [ff, "-y", "-v", "error"]
     if bg.get("type") == "image":
         cmd += ["-loop", "1", "-framerate", "30", "-i", bg["value"]]
         vfilter = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-                   f"crop={w}:{h},setsar=1[bg];")
+                   f"crop={w}:{h},{blur}setsar=1[bg];")
     elif bg.get("type") == "video":
         cmd += ["-stream_loop", "-1", "-i", bg["value"]]
         vfilter = (f"[0:v]scale={w}:{h}:force_original_aspect_ratio=increase,"
-                   f"crop={w}:{h},fps=30,setsar=1[bg];")
+                   f"crop={w}:{h},fps=30,{blur}setsar=1[bg];")
     else:
         color = (bg.get("value") or "#0b0e1a").replace("#", "0x")
         cmd += ["-f", "lavfi", "-i", f"color=c={color}:s={w}x{h}:r=30"]
@@ -260,8 +325,9 @@ def render_video(bg, audio_wav, ass_path, out_mp4, duration, progress_cb=None,
     out_mp4 = os.path.abspath(out_mp4)
     if bg.get("type") in ("image", "video"):
         bg = {**bg, "value": os.path.abspath(bg["value"])}
-    ass_name = os.path.basename(ass_path)
-    ass_dir = os.path.dirname(os.path.abspath(ass_path))
+    ass_name = os.path.basename(ass_path) if ass_path else None
+    ass_dir = os.path.dirname(os.path.abspath(ass_path)) if ass_path else None
+    sub = f"[bg]ass='{ass_name}'[vsub];" if ass_path else "[bg]null[vsub];"
     bar_input = []
     if progress_bar and duration > 0:
         # Thanh tiến trình: dải vàng full bề ngang được phủ bằng overlay
@@ -269,20 +335,32 @@ def render_video(bg, audio_wav, ass_path, out_mp4, duration, progress_cb=None,
         # KHÔNG dùng drawbox/crop: cả hai đều không có biến t theo khung
         # cho tham số kích thước (đã đo thực tế trên bản ffmpeg này);
         # overlay thì có.
-        vfilter += (f"[bg]ass='{ass_name}'[vsub];"
+        vfilter += (sub +
                     f"[vsub][2:v]overlay=x='(t/{duration:.3f}-1)*overlay_w':y=0[vout]")
         bar_input = ["-f", "lavfi", "-i", f"color=c=0xFFD400:s={w}x6:r=30"]
     else:
-        vfilter += f"[bg]ass='{ass_name}'[vout]"
+        vfilter += sub.rstrip(";").replace("[vsub]", "[vout]")
     cmd += ["-i", audio_wav] + bar_input + [
             "-filter_complex", vfilter,
-            "-map", "[vout]", "-map", "1:a",
-            "-c:v", "libx264", "-preset", "medium", "-crf", "20",
-            "-pix_fmt", "yuv420p", "-r", "30",
+            "-map", "[vout]", "-map", "1:a"]
+    tail = ["-pix_fmt", "yuv420p", "-r", "30",
             "-c:a", "aac", "-b:a", "192k",
             "-t", f"{duration:.3f}", "-movflags", "+faststart", out_mp4]
-    _run(cmd, progress_cb, duration, "xuất video", cwd=ass_dir,
-         timeout=int(max(180, duration * 6)))
+    big = 2 if w * h > 1920 * 1080 else 1
+    timeout = int(max(180, duration * 6 * big))
+    used = "nvenc" if encoder == "nvenc" else "cpu"
+    try:
+        _run(cmd + _vcodec_args(used, bitrate_k) + tail, progress_cb,
+             duration, "xuất video", cwd=ass_dir, timeout=timeout)
+    except RuntimeError:
+        if used != "nvenc":
+            raise
+        # GPU báo có nhưng mã hoá sập giữa chừng -> lùi về CPU, không chết.
+        used = "cpu"
+        _run(cmd + _vcodec_args(used, bitrate_k) + tail, progress_cb,
+             duration, "xuất video (CPU dự phòng)", cwd=ass_dir,
+             timeout=timeout)
+    return used
 
 
 def extract_frame(video, at_sec, out_png):
