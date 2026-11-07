@@ -27,6 +27,15 @@
     </div>
   </section>
 
+  <!-- TỰ ĐỘNG TOÀN PHẦN -->
+  <section class="card locked" id="stepAuto">
+    <h2><span class="num">⚡</span> Tự động toàn phần — 1 chạm là có video</h2>
+    <p class="hint">Nạp bài ở bước 1 xong bấm nút này: app tự tách beat, tự nghe &amp; chép lời, tự căn nhịp theo từng từ, tự xuất video theo mẫu ở bước 5 — bạn không cần làm thêm bước nào. Nếu đã dán lời đúng ở bước 3 thì app dùng lời đó (chuẩn hơn lời AI tự chép). Lần đầu dùng AI sẽ tải model ~470 MB, các lần sau chạy offline.</p>
+    <button class="primary big" id="btnAutoAll" disabled>⚡ Làm video karaoke tự động</button>
+    <div class="progress" id="autoProgress" hidden><div class="bar"></div><span class="pct">0%</span></div>
+    <div class="ok" id="autoOk"></div>
+  </section>
+
   <!-- BƯỚC 2 -->
   <section class="card locked" id="step2">
     <h2><span class="num">2</span> Tách beat (bỏ giọng hát)</h2>
@@ -98,13 +107,40 @@
         </div>
         <div class="lbl">Cỡ chữ: <span id="sizeVal">64</span></div>
         <input type="range" id="fontSize" min="44" max="100" value="64">
+        <div class="lbl">Mẫu chữ có sẵn — chọn là áp dụng ngay</div>
+        <div class="presets" id="presetGrid"></div>
+        <div class="lbl">Font chữ</div>
+        <select id="fontSel">
+          <option value="Arial">Arial</option>
+          <option value="Segoe UI">Segoe UI</option>
+          <option value="Tahoma">Tahoma</option>
+          <option value="Verdana">Verdana</option>
+          <option value="Times New Roman">Times New Roman</option>
+        </select>
+        <div class="lbl">Hiệu ứng chữ chạy</div>
+        <select id="effectSel">
+          <option value="sweep">Quét mượt — chữ tô dần đều như karaoke xịn</option>
+          <option value="pop">Nhảy từng từ</option>
+        </select>
+        <label class="chk"><input type="checkbox" id="twoLineChk" checked> Hiện câu kế tiếp ở dưới</label>
+        <label class="chk"><input type="checkbox" id="fadeChk" checked> Chữ mờ dần khi vào / hết câu</label>
+        <div class="lbl">Tên bài hiện ở mở đầu video</div>
+        <input type="text" id="songTitle" placeholder="Để trống = lấy theo tên file bài hát">
       </div>
       <div>
         <div class="lbl">Nền video</div>
         <div class="modes col">
-          <label class="mode"><input type="radio" name="bgtype" value="color" checked><div><b>Đen đơn giản</b></div></label>
+          <label class="mode"><input type="radio" name="bgtype" value="gradient" checked><div><b>Mẫu nền có sẵn</b></div></label>
+          <label class="mode"><input type="radio" name="bgtype" value="color"><div><b>Đen đơn giản</b></div></label>
           <label class="mode"><input type="radio" name="bgtype" value="image"><div><b>Ảnh của bạn</b></div></label>
           <label class="mode"><input type="radio" name="bgtype" value="video"><div><b>Video nền</b></div></label>
+        </div>
+        <div class="gradrow" id="gradRow">
+          <button class="grad active" data-g="demtim" style="--g1:#160a2e;--g2:#5b2a86">Đêm tím</button>
+          <button class="grad" data-g="hoanghon" style="--g1:#b7416b;--g2:#f2a65a">Hoàng hôn</button>
+          <button class="grad" data-g="biensau" style="--g1:#081c2c;--g2:#14607e">Biển sâu</button>
+          <button class="grad" data-g="rungdem" style="--g1:#0a1f14;--g2:#2e7d4f">Rừng đêm</button>
+          <button class="grad" data-g="neon" style="--g1:#14061f;--g2:#a4136b">Hồng neon</button>
         </div>
         <div class="row">
           <label class="filebtn">Tải ảnh nền<input type="file" id="bgImageFile" accept="image/*" hidden></label>

@@ -132,6 +132,32 @@ def center_cut(in_wav, out_wav, progress_cb=None, duration=None):
     _run(cmd, progress_cb, duration, "tách beat nhanh")
 
 
+GRADIENTS = {
+    "demtim": ("Đêm tím", ["0x160a2e", "0x5b2a86"]),
+    "hoanghon": ("Hoàng hôn", ["0x2e1a47", "0xb7416b", "0xf2a65a"]),
+    "biensau": ("Biển sâu", ["0x081c2c", "0x14607e"]),
+    "rungdem": ("Rừng đêm", ["0x0a1f14", "0x2e7d4f"]),
+    "neon": ("Hồng neon", ["0x14061f", "0xa4136b"]),
+}
+
+
+def make_gradient_bg(kind, out_png):
+    """Tạo ảnh nền gradient 1920x1080 theo mẫu (kèm vignette + nhiễu hạt nhẹ
+    cho cảm giác cao cấp). kind lạ -> dùng 'demtim'."""
+    _label, colors = GRADIENTS.get(kind, GRADIENTS["demtim"])
+    src = "gradients=s=1920x1080:" + ":".join(
+        f"c{i}={c}" for i, c in enumerate(colors))
+    src += f":nb_colors={len(colors)}:x0=0:y0=0:x1=1920:y1=1080"
+    cmd = [ffmpeg_bin(), "-y", "-v", "error", "-f", "lavfi", "-i", src,
+           "-vf", "vignette=angle=PI/5,noise=alls=5:allf=t",
+           "-frames:v", "1", out_png]
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+    if r.returncode != 0 or not os.path.exists(out_png):
+        raise RuntimeError("Không tạo được nền gradient: "
+                           + (r.stderr or "")[-200:])
+    return out_png
+
+
 def mix_with_guide(inst_wav, orig_wav, guide_pct, out_wav):
     """Trộn beat với một phần giọng gốc (guide_pct 0-40%) làm giọng dẫn."""
     g = max(0.0, min(40.0, float(guide_pct))) / 100.0

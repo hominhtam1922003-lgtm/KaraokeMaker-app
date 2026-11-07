@@ -2,7 +2,8 @@
 const $ = (id) => document.getElementById(id);
 const state = {
   duration: 0, instReady: false, lines: [], tapped: false,
-  tapIndex: 0, tapping: false, color: "#FFD400",
+  tapIndex: 0, tapping: false, color: "#FFD400", baseColor: "#FFFFFF",
+  outlineW: 3, gradKind: "demtim",
 };
 const tapAudio = new Audio();
 tapAudio.preload = "auto";
@@ -69,7 +70,8 @@ $("songFile").addEventListener("change", async (e) => {
     $("btnSeparate").disabled = false;
     state.instReady = false;
     $("instInfo").hidden = true;
-    unlock("step2"); unlock("step3");
+    unlock("step2"); unlock("step3"); unlock("stepAuto");
+    $("btnAutoAll").disabled = false;
     toast("Đã nạp bài hát. Tách beat ở bước 2 nhé.");
   } catch (err) {
     $("songDropText").textContent = "Bấm để chọn file bài hát";
@@ -98,7 +100,9 @@ $("btnSeparate").addEventListener("click", async () => {
 
 /* ---------- Bước 3: lời ---------- */
 function setLines(lines, withTimes) {
-  state.lines = lines.map((l) => ({ text: l.text, start: withTimes ? l.start : null }));
+  state.lines = lines.map((l) => ({
+    text: l.text, start: withTimes ? l.start : null, words: l.words || null,
+  }));
   state.tapIndex = 0; state.tapping = false; tapAudio.pause();
   $("btnTap").textContent = "▶ Phát & căn nhịp";
   $("btnTapUndo").disabled = true; $("btnTapRestart").disabled = !state.lines.length;
@@ -274,6 +278,56 @@ tapAudio.addEventListener("ended", () => {
 });
 
 /* ---------- Bước 5: kiểu & nền ---------- */
+const PRESETS = [
+  { name: "Vàng Cổ Điển", color: "#FFD400", base: "#FFFFFF", font: "Arial", size: 64, outline: 3 },
+  { name: "Neon Hồng", color: "#FF2E88", base: "#E8E8FF", font: "Segoe UI", size: 68, outline: 4 },
+  { name: "Ngọc Biển", color: "#00E5FF", base: "#FFFFFF", font: "Tahoma", size: 64, outline: 3 },
+  { name: "Tím Mộng", color: "#B388FF", base: "#F3E5F5", font: "Segoe UI", size: 66, outline: 3 },
+  { name: "Đỏ Rượu", color: "#FF5252", base: "#FFE0B2", font: "Times New Roman", size: 68, outline: 3 },
+  { name: "Trắng Tối Giản", color: "#FFFFFF", base: "#9E9E9E", font: "Verdana", size: 60, outline: 2 },
+  { name: "Xanh Lá Tươi", color: "#69F0AE", base: "#FFFFFF", font: "Arial", size: 64, outline: 3 },
+  { name: "Cam Hoàng Hôn", color: "#FF9100", base: "#FFF3E0", font: "Tahoma", size: 66, outline: 3 },
+  { name: "Hồng Phấn", color: "#FF80AB", base: "#FFFFFF", font: "Segoe UI", size: 66, outline: 3 },
+  { name: "Xanh Đêm", color: "#40C4FF", base: "#E1F5FE", font: "Verdana", size: 62, outline: 3 },
+];
+function applyPreset(p, btn) {
+  state.color = p.color; state.baseColor = p.base; state.outlineW = p.outline;
+  $("fontSel").value = p.font;
+  $("fontSize").value = p.size; $("sizeVal").textContent = p.size;
+  document.querySelectorAll(".sw").forEach((x) =>
+    x.classList.toggle("active", x.dataset.color === p.color));
+  document.querySelectorAll(".preset").forEach((x) => x.classList.remove("active"));
+  if (btn) btn.classList.add("active");
+}
+PRESETS.forEach((p, i) => {
+  const b = document.createElement("button");
+  b.className = "preset" + (i === 0 ? " active" : "");
+  b.innerHTML = `<span class="dot" style="background:${p.color}"></span>` +
+    `<span class="dot" style="background:${p.base}"></span> ${p.name}`;
+  b.onclick = () => applyPreset(p, b);
+  $("presetGrid").appendChild(b);
+});
+$("gradRow").addEventListener("click", (e) => {
+  const b = e.target.closest(".grad");
+  if (!b) return;
+  document.querySelectorAll(".grad").forEach((x) => x.classList.remove("active"));
+  b.classList.add("active");
+  state.gradKind = b.dataset.g;
+  document.querySelector('input[name="bgtype"][value="gradient"]').checked = true;
+});
+function collectStyle() {
+  return {
+    color: state.color, base_color: state.baseColor,
+    size: Number($("fontSize").value), font: $("fontSel").value,
+    effect: $("effectSel").value, fade: $("fadeChk").checked,
+    two_line: $("twoLineChk").checked, outline_w: state.outlineW,
+  };
+}
+function currentBg() {
+  const t = document.querySelector('input[name="bgtype"]:checked').value;
+  if (t === "gradient") return { type: "gradient", value: state.gradKind };
+  return { type: t, value: "#0b0e1a" };
+}
 $("colorSwatches").addEventListener("click", (e) => {
   const b = e.target.closest(".sw");
   if (!b) return;
@@ -292,18 +346,55 @@ $("bgImageFile").addEventListener("change", (e) => e.target.files[0] && uploadBg
 $("bgVideoFile").addEventListener("change", (e) => e.target.files[0] && uploadBg(e.target.files[0], "video").catch((err) => toast(err.message, true)));
 $("guide").addEventListener("input", (e) => ($("guideVal").textContent = e.target.value + "%"));
 
+/* ---------- Tự động toàn phần ---------- */
+$("btnAutoAll").addEventListener("click", async () => {
+  if (!state.duration) return toast("Chưa có bài hát — làm bước 1 trước.", true);
+  $("btnAutoAll").disabled = true;
+  $("autoOk").textContent = "";
+  try {
+    const style = collectStyle();
+    const { job } = await postJSON("/api/auto-all", {
+      lyrics: state.lines.length ? state.lines.map((l) => l.text) : null,
+      sep_mode: document.querySelector('input[name="sepmode"]:checked').value,
+      style,
+      title: $("songTitle").value.trim(),
+      guide: Number($("guide").value),
+      bg: currentBg(),
+    });
+    pollJob(job, $("autoProgress"), (res) => {
+      $("btnAutoAll").disabled = false;
+      state.instReady = true;
+      $("instPlayer").src = bust("/api/audio/inst");
+      $("instInfo").hidden = false;
+      setLines(res.lines, true);
+      $("renderDone").hidden = false;
+      $("outVideo").src = bust("/api/video");
+      unlock("step5"); unlock("step6");
+      $("autoOk").textContent = res.source === "ai"
+        ? `Xong! AI tự chép & căn ${res.count} câu. Nghe thử — sai chữ ở đâu thì sửa lời ở bước 3 rồi bấm Tự căn bằng AI để làm lại chuẩn hơn.`
+        : `Xong! Dùng lời bạn dán, AI khớp ${Math.round((res.matched || 0) * 100)}% số từ, ${res.count} câu.`;
+      toast("Video karaoke tự động xong! 🎉");
+    }, (e) => { $("btnAutoAll").disabled = false; toast(e, true); });
+  } catch (err) {
+    $("btnAutoAll").disabled = false;
+    toast(err.message, true);
+  }
+});
+
 /* ---------- Bước 6: xuất video ---------- */
 $("btnRender").addEventListener("click", async () => {
   const missing = state.lines.filter((l) => l.start == null).length;
   if (missing) return toast(`Còn ${missing} câu chưa căn nhịp.`, true);
-  const bgType = document.querySelector('input[name="bgtype"]:checked').value;
   $("btnRender").disabled = true;
   try {
+    const style = collectStyle();
+    const title = $("songTitle").value.trim();
+    if (title) style.title = title;
     const { job } = await postJSON("/api/render", {
-      lines: state.lines.map((l) => ({ start: l.start, text: l.text })),
-      style: { color: state.color, size: Number($("fontSize").value) },
+      lines: state.lines.map((l) => ({ start: l.start, text: l.text, words: l.words })),
+      style,
       guide: Number($("guide").value),
-      bg: { type: bgType, value: "#0b0e1a" },
+      bg: currentBg(),
       audio: state.instReady ? "inst" : "orig",
     });
     pollJob(job, $("renderProgress"), () => {

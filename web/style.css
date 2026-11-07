@@ -72,4 +72,20 @@ textarea {
 }
 .row { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-top: 12px; }
 .ok { color: var
-...[truncated 2085 chars]
+...[truncated 2085 chars].presets { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 6px; }
+.preset { padding: 8px 12px; font-size: 14px; display: inline-flex; align-items: center; gap: 5px; }
+.preset.active { border-color: var(--accent); background: var(--card); box-shadow: 0 0 0 1px var(--accent); }
+.preset .dot { width: 13px; height: 13px; border-radius: 50%; display: inline-block; border: 1px solid rgba(255,255,255,.35); }
+select, input[type="text"] {
+  width: 100%; background: var(--card2); color: var(--text); border: 1px solid var(--line);
+  border-radius: 10px; padding: 9px 12px; font-size: 15px; margin-bottom: 4px;
+}
+.chk { display: flex; align-items: center; gap: 8px; font-size: 15px; padding: 5px 0; cursor: pointer; }
+.chk input { accent-color: var(--accent2); width: 17px; height: 17px; }
+.gradrow { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
+.grad {
+  background: linear-gradient(135deg, var(--g1), var(--g2)); color: #fff;
+  text-shadow: 0 1px 3px rgba(0,0,0,.7); font-weight: 600;
+}
+.grad.active { border-color: var(--accent); box-shadow: 0 0 0 1px var(--accent); }
+#stepAuto { border-color: var(--accent2); }

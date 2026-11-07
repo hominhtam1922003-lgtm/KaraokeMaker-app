@@ -4,12 +4,15 @@ App PC làm video karaoke: tách beat bằng AI (UVR-MDX-NET), căn nhịp lời
 
 ## Cách dùng (bản .exe)
 
-1. Mở `KaraokeMaker.exe` — trình duyệt tự bật giao diện.
-2. Nạp file bài hát (nhạc hoặc video).
-3. Tách beat: chế độ **AI** (sạch, chậm hơn) hoặc **Nhanh** (cắt giọng stereo).
-4. Dán lời (mỗi dòng một câu) hoặc nạp file `.lrc` có sẵn mốc giờ.
-5. Nếu chưa có `.lrc`: bấm **Tự căn bằng AI** — app nghe bài hát (Whisper) rồi tự gắn mốc giờ từng câu (lần đầu dùng tải model ~470 MB); hoặc căn tay bằng cách bấm nút/Space đúng lúc mỗi câu bắt đầu. Dán lời từ web nhạc vào, app tự bỏ các dòng nhãn mục kiểu `--:--Verse:`, `[Chorus]`.
-6. Chọn màu chữ, cỡ chữ, nền (đen / ảnh / video), giọng dẫn 0–40% rồi xuất MP4.
+**Cách nhanh nhất — tự động toàn phần:** mở `KaraokeMaker.exe` → nạp file bài hát → bấm **⚡ Làm video karaoke tự động**. App tự tách beat, tự nghe & chép lời (Whisper), tự căn nhịp theo từng từ, tự xuất video. Xong!
+
+**Cách thủ công (kiểm soát từng bước):**
+
+1. Nạp file bài hát (nhạc hoặc video).
+2. Tách beat: chế độ **AI** (sạch, chậm hơn) hoặc **Nhanh** (cắt giọng stereo).
+3. Dán lời (mỗi dòng một câu) hoặc nạp file `.lrc` có sẵn mốc giờ. Dán lời từ web nhạc vào, app tự bỏ các dòng nhãn mục kiểu `--:--Verse:`, `[Chorus]`.
+4. Nếu chưa có `.lrc`: bấm **Tự căn bằng AI** để app gắn mốc giờ (lần đầu dùng tải model ~470 MB), hoặc căn tay bằng nút/Space.
+5. Chọn **mẫu chữ** (10 mẫu có sẵn) hoặc tự chỉnh màu/font/cỡ chữ, hiệu ứng chữ chạy (quét mượt / nhảy từng từ), hiện câu kế tiếp, thẻ tên bài mở đầu; chọn nền (5 mẫu gradient / đen / ảnh / video), giọng dẫn 0–40% rồi xuất MP4.
 
 Mọi xử lý chạy local trên máy, không cần internet (trừ lần tải app).
 

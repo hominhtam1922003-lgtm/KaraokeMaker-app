@@ -66,7 +66,15 @@ def new_job(fn):
     return jid
 
 
-ACTIVE = {"separate": None, "render": None, "align": None}
+ACTIVE = {"separate": None, "render": None, "align": None, "autoall": None}
+
+
+def any_job_running():
+    """Có bất kỳ tác vụ nền nào đang chạy không — các tác vụ ghi chung bộ file
+    trong thư mục session nên phải chạy lần lượt, không song song."""
+    with LOCK:
+        return any((JOBS.get(ACTIVE.get(k) or "") or {}).get("status") == "running"
+                   for k in ACTIVE)
 
 
 def start_job(kind, fn):
@@ -148,6 +156,23 @@ class Handler(BaseHTTPRequestHandler):
     def _body_json(self):
         raw = self._body()
         return json.loads(raw.decode("utf-8")) if raw else {}
+
+    def _resolve_bg(self, bg_req):
+        """Chọn nền video từ yêu cầu: ảnh/video người dùng tải lên, mẫu
+        gradient có sẵn (tạo ảnh 1 lần rồi dùng lại), hoặc màu trơn."""
+        bg_req = bg_req or {}
+        t = bg_req.get("type")
+        if t == "image" and STATE["bg_image"]:
+            return {"type": "image", "value": STATE["bg_image"]}
+        if t == "video" and STATE["bg_video"]:
+            return {"type": "video", "value": STATE["bg_video"]}
+        if t == "gradient":
+            kind = str(bg_req.get("value") or "demtim")
+            path = os.path.join(WORK, f"grad_{kind}.png")
+            if not os.path.exists(path):
+                media.make_gradient_bg(kind, path)
+            return {"type": "image", "value": path}
+        return {"type": "color", "value": bg_req.get("value", "#0b0e1a")}
 
     # ---------- GET ----------
     def do_GET(self):
@@ -251,6 +276,9 @@ class Handler(BaseHTTPRequestHandler):
                         mdx.separate_mdx(song_wav, out, progress_cb=cb)
                     STATE.update(inst_wav=out, inst_mode=mode)
                     return {"mode": mode}
+                if any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
                 jid = start_job("separate", job)
                 if jid is None:
                     return self._json(
@@ -288,11 +316,16 @@ class Handler(BaseHTTPRequestHandler):
                     from karaoke import align as alg
                     heard = alg.transcribe_words(song_wav, duration, cb,
                                                   models_dir)
-                    starts, ratio = alg.align_lines(heard, texts, duration)
-                    lines = [{"text": t, "start": s}
-                             for t, s in zip(texts, starts)]
-                    return {"lines": lines, "matched": ratio,
+                    full = alg.align_full(heard, texts, duration)
+                    lines = [{"text": t, "start": s,
+                              "words": [list(x) for x in ws]}
+                             for t, s, ws in zip(texts, full["starts"],
+                                                 full["words"])]
+                    return {"lines": lines, "matched": full["ratio"],
                             "heard": len(heard)}
+                if any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
                 jid = start_job("align", job)
                 if jid is None:
                     return self._json(
@@ -331,12 +364,7 @@ class Handler(BaseHTTPRequestHandler):
                 ass_path = os.path.join(WORK, "lyrics.ass")
                 with open(ass_path, "w", encoding="utf-8") as f:
                     f.write(lyr.build_ass(timed, style))
-                if bg_req.get("type") == "image" and STATE["bg_image"]:
-                    bg = {"type": "image", "value": STATE["bg_image"]}
-                elif bg_req.get("type") == "video" and STATE["bg_video"]:
-                    bg = {"type": "video", "value": STATE["bg_video"]}
-                else:
-                    bg = {"type": "color", "value": bg_req.get("value", "#0b0e1a")}
+                bg = self._resolve_bg(bg_req)
                 out_mp4 = os.path.join(WORK, "karaoke.mp4")
                 song_wav = STATE["song_wav"]
 
@@ -349,10 +377,105 @@ class Handler(BaseHTTPRequestHandler):
                     media.render_video(bg, audio, ass_path, out_mp4, duration, cb)
                     STATE["out_mp4"] = out_mp4
                     return {"video": "/api/video"}
+                if any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
                 jid = start_job("render", job)
                 if jid is None:
                     return self._json(
                         {"error": "Đang xuất video dở — chờ xong đã"}, 409)
+                self._json({"job": jid})
+
+            elif path == "/api/auto-all":
+                # TỰ ĐỘNG TOÀN PHẦN: tách beat -> nghe & chép lời -> gắn mốc
+                # giờ từng câu/từ -> xuất video, trong MỘT tác vụ duy nhất.
+                if not STATE["song_wav"]:
+                    return self._json({"error": "Chưa có bài hát"}, 400)
+                req = self._body_json()
+                texts = req.get("lyrics")
+                if isinstance(texts, list):
+                    texts = [str(t).strip() for t in texts if str(t).strip()]
+                    if not texts:
+                        texts = None  # không dán lời -> AI tự chép
+                else:
+                    texts = None
+                if texts and len(texts) > 600:
+                    return self._json({"error": "Quá nhiều câu lời"}, 400)
+                sep_mode = "fast" if req.get("sep_mode") == "fast" else "ai"
+                style = req.get("style") or {}
+                title = str(req.get("title") or "").strip() or os.path.splitext(
+                    STATE["song_name"] or "Karaoke")[0]
+                try:
+                    guide = float(req.get("guide") or 0)
+                except (TypeError, ValueError):
+                    guide = 0.0
+                bg = self._resolve_bg(req.get("bg")
+                                      or {"type": "gradient", "value": "demtim"})
+                song_wav, duration = STATE["song_wav"], STATE["duration"]
+                if duration <= 0:
+                    return self._json(
+                        {"error": "Không đọc được thời lượng bài hát"}, 400)
+                models_dir = os.path.join(ROOT, "models")
+                inst_out = os.path.join(WORK, "inst.wav")
+                ass_path = os.path.join(WORK, "lyrics.ass")
+                out_mp4 = os.path.join(WORK, "karaoke.mp4")
+
+                def job(cb):
+                    def scaled(lo, hi):
+                        return lambda p, label="": cb(
+                            lo + (hi - lo) * float(p) / 100.0, label)
+                    cb(1, "Đang tách beat...")
+                    if sep_mode == "fast":
+                        media.center_cut(song_wav, inst_out, scaled(2, 30),
+                                         duration)
+                    else:
+                        mdx.separate_mdx(song_wav, inst_out,
+                                         progress_cb=scaled(2, 30))
+                    STATE.update(inst_wav=inst_out, inst_mode=sep_mode)
+                    from karaoke import align as alg
+                    segs = alg.transcribe_segments(song_wav, duration,
+                                                   scaled(32, 68), models_dir)
+                    cb(70, "Đang gắn mốc giờ từng câu...")
+                    if texts:
+                        heard = [w for s in segs for w in s["words"]]
+                        full = alg.align_full(heard, texts, duration)
+                        raw = [{"text": t, "start": s,
+                                "words": [list(x) for x in ws]}
+                               for t, s, ws in zip(texts, full["starts"],
+                                                   full["words"])]
+                        matched, source = full["ratio"], "user"
+                    else:
+                        raw = alg.segments_to_lines(segs)
+                        matched, source = 1.0, "ai"
+                    if not raw:
+                        raise ValueError(
+                            "Không tạo được lời từ bài này — thử dán lời vào "
+                            "bước 3 rồi bấm Tự căn bằng AI")
+                    timed = lyr.assign_ends(raw, duration)
+                    st = dict(style)
+                    if title:
+                        st["title"] = title
+                    with open(ass_path, "w", encoding="utf-8") as f:
+                        f.write(lyr.build_ass(timed, st))
+                    cb(80, "Đang xuất video...")
+                    audio = inst_out
+                    if guide > 0:
+                        mixed = os.path.join(WORK, "mixed.wav")
+                        media.mix_with_guide(inst_out, song_wav, guide, mixed)
+                        audio = mixed
+                    media.render_video(bg, audio, ass_path, out_mp4, duration,
+                                       scaled(80, 100))
+                    STATE["out_mp4"] = out_mp4
+                    return {"video": "/api/video", "lines": timed,
+                            "matched": matched, "source": source,
+                            "count": len(timed)}
+                if any_job_running():
+                    return self._json(
+                        {"error": "Đang có tác vụ chạy dở — chờ xong đã"}, 409)
+                jid = start_job("autoall", job)
+                if jid is None:
+                    return self._json(
+                        {"error": "Đang làm video tự động dở — chờ xong đã"}, 409)
                 self._json({"job": jid})
 
             else:

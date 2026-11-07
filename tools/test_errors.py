@@ -132,7 +132,7 @@ def _():
                           "text": r"Chữ {lạ} \ đường 🎤 <ok> 100%"}],
                         {"color": "#FFD400"})
     body = [l for l in ass.splitlines() if l.startswith("Dialogue:")][0]
-    body = _re.sub(r"\{\\k\d+\}", "", body)
+    body = _re.sub(r"\{[^}]*\}", "", body)  # gỡ mọi thẻ override ASS hợp lệ (\k, \kf, \fad...)
     assert "{" not in body and "}" not in body, body
     assert "\\" not in body.split(",,", 1)[-1], body
 
