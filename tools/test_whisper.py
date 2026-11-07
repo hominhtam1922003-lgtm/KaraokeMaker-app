@@ -43,6 +43,45 @@ class WhisperModel:
         os._exit(3)
 '''
 NOLIB = 'raise ImportError("No module named faster_whisper (stub)")\n'
+# Treo cứng khi xin giờ từng từ (đúng ca bệnh máy thật 07/11); chế độ đoạn
+# (không giờ từng từ) thì chạy được nhưng không trả từ nào.
+HANG = '''
+import time
+class _Seg:
+    def __init__(self, text, start, end):
+        self.text, self.words, self.start, self.end = text, None, start, end
+class WhisperModel:
+    def __init__(self, *a, **k): pass
+    def transcribe(self, path, **kw):
+        if kw.get("word_timestamps"):
+            time.sleep(3600)
+        segs = [_Seg(" Ngày thay đêm vội trôi", 2.0, 4.4),
+                _Seg(" Tôi lênh đênh trên biển vắng", 5.0, 8.2)]
+        return iter(segs), {}
+'''
+# Chạy chậm nhưng còn sống: ra 1 đoạn, ngủ 6 giây, ra đoạn nữa.
+SLOW = '''
+import time
+class _W:
+    def __init__(self, word, start, end):
+        self.word, self.start, self.end = word, start, end
+class _Seg:
+    def __init__(self, text, words, start, end):
+        self.text, self.words, self.start, self.end = text, words, start, end
+def _mk(ln, t0):
+    ws, t = [], t0
+    for w in ln.split():
+        ws.append(_W(" " + w, t, t + 0.3)); t += 0.32
+    return _Seg(" " + ln, ws, ws[0].start, ws[-1].end)
+class WhisperModel:
+    def __init__(self, *a, **k): pass
+    def transcribe(self, path, **kw):
+        def gen():
+            yield _mk("Ngày thay đêm vội trôi", 2.0)
+            time.sleep(6)
+            yield _mk("Tôi lênh đênh trên biển vắng", 5.0)
+        return gen(), {}
+'''
 
 
 def check(name, cond, extra=""):
@@ -110,6 +149,43 @@ def unit_cases():
         check("load_model_only qua worker: ok", True)
     except Exception as e:  # noqa: BLE001
         check("load_model_only qua worker: ok", False, str(e)[:120])
+    # 5) THANG DỰ PHÒNG: treo ở chế độ giờ-từ -> tự xuống chế độ đoạn và
+    # tổng hợp giờ cho từng từ (ca bệnh thật: đứng 47,2% suốt 12 phút).
+    write_stub("/tmp/fwstub_hang", HANG)
+    os.environ["PYTHONPATH"] = "/tmp/fwstub_hang"
+    os.environ["KARAOKE_WHISPER_STALL_S"] = "3"
+    os.environ["KARAOKE_WHISPER_HEARTBEAT_S"] = "1"
+    t0 = time.time()
+    try:
+        segs = align.transcribe_segments(wav, 12.0, None, models)
+        dt = time.time() - t0
+        ok_words = bool(segs and segs[0]["words"]) and all(
+            segs[0]["start"] <= w["start"] < w["end"] <= segs[0]["end"] + 0.01
+            for w in segs[0]["words"])
+        check("thang dự phòng: treo -> vẫn ra đoạn + từ tổng hợp",
+              len(segs) == 2 and ok_words, f"{dt:.0f}s")
+        check("thang dự phòng: tổng thời gian bị chặn (không treo 12 phút)",
+              dt < 60, f"{dt:.0f}s")
+    except Exception as e:  # noqa: BLE001
+        check("thang dự phòng: treo -> vẫn ra đoạn + từ tổng hợp", False,
+              str(e)[:150])
+    # 6) NHỊP TIM: worker chậm nhưng sống -> client tự phát "Vẫn đang..."
+    write_stub("/tmp/fwstub_slow", SLOW)
+    os.environ["PYTHONPATH"] = "/tmp/fwstub_slow"
+    os.environ["KARAOKE_WHISPER_STALL_S"] = "30"
+    os.environ["KARAOKE_WHISPER_HEARTBEAT_S"] = "2"
+    labels = []
+    try:
+        segs = align.transcribe_segments(
+            wav, 12.0, lambda p, l="": labels.append(l), models)
+        check("nhịp tim: có nhãn 'Vẫn đang' khi worker im lặng",
+              any("Vẫn đang" in l for l in labels), str(labels)[:150])
+        check("nhịp tim: đoạn vẫn ra đủ", len(segs) == 2)
+    except Exception as e:  # noqa: BLE001
+        check("nhịp tim: có nhãn 'Vẫn đang' khi worker im lặng", False,
+              str(e)[:150])
+    os.environ.pop("KARAOKE_WHISPER_STALL_S", None)
+    os.environ.pop("KARAOKE_WHISPER_HEARTBEAT_S", None)
 
 
 def req(base, method, path, body=None, raw=None, headers=None):

@@ -12,9 +12,17 @@ Giao thức: in từng dòng JSON ra stdout:
   {"error": str}                — lỗi (thoát mã 1)
 
 Chạy độc lập được (không import package karaoke):
-  python whisper_worker.py segments <wav> <models_dir|""> <duration>
+  python whisper_worker.py segments <src> <models_dir|""> <duration>
+                             [cpu_threads] [word_ts 1|0] [pcm 1|0]
   python whisper_worker.py load-only <models_dir|"">
 Trong bản đóng gói: KaraokeMaker.exe --whisper-worker <tham số như trên>.
+
+src có thể là file WAV (worker nhờ faster-whisper tự giải mã) hoặc file PCM
+float32 16kHz mono đã giải mã sẵn (pcm=1) — đường PCM là mặc định của app:
+app giải mã bằng ffmpeg của chính nó rồi đưa mảng số thẳng cho Whisper, bỏ
+hẳn khâu giải mã bằng PyAV (mắt xích native từng gây treo trên Windows).
+cpu_threads: giới hạn luồng CPU cho CTranslate2 — để mặc định (0 = mọi nhân)
+từng gây treo/quá tải trên một số máy Windows; app luôn truyền số cụ thể.
 """
 import json
 import os
@@ -42,7 +50,7 @@ def _dir_size(path):
     return total
 
 
-def _load_model(models_dir, progress=True):
+def _load_model(models_dir, progress=True, cpu_threads=0):
     if models_dir:
         os.environ.setdefault("HF_HOME", models_dir)
     try:
@@ -72,7 +80,8 @@ def _load_model(models_dir, progress=True):
         watcher.start()
     try:
         return WhisperModel(MODEL_NAME, device="cpu", compute_type="int8",
-                            download_root=models_dir or None)
+                            download_root=models_dir or None,
+                            cpu_threads=int(cpu_threads or 0))
     except Exception as e:  # noqa: BLE001
         raise RuntimeError(
             "Không tải/nạp được model AI nghe lời (lần đầu cần có mạng): "
@@ -81,15 +90,26 @@ def _load_model(models_dir, progress=True):
         stop.set()
 
 
-def _segments(wav_path, models_dir, duration):
+def _segments(src, models_dir, duration, cpu_threads=0, word_ts=True,
+              is_pcm=False):
     emit({"pct": 3, "label": "Đang nạp model AI nghe lời — lần đầu dùng sẽ "
                             "tải khoảng 470 MB, các lần sau dùng lại luôn"})
-    model = _load_model(models_dir)
+    model = _load_model(models_dir, cpu_threads=cpu_threads)
     emit({"pct": 10, "label": "Đang nghe bài hát..."})
+    source = src
+    if is_pcm:
+        import numpy as np
+        source = np.fromfile(src, dtype=np.float32)
+        if source.size == 0:
+            raise ValueError("Dữ liệu âm thanh rỗng — không nghe được gì")
     segments = []
     try:
+        # condition_on_previous_text=False: bài hát có đoạn nhạc dài không
+        # lời — để mặc định True khiến model dễ lặp chữ/đuôi suy luận rất
+        # lâu trên đoạn nhạc (trông như treo). Tắt là chuẩn cho nhạc.
         segs, _info = model.transcribe(
-            wav_path, word_timestamps=True, beam_size=1, vad_filter=False)
+            source, word_timestamps=word_ts, beam_size=1, vad_filter=False,
+            condition_on_previous_text=False)
         for seg in segs:
             words = [{"w": (wd.word or "").strip(),
                       "start": float(wd.start), "end": float(wd.end)}
@@ -124,10 +144,17 @@ def main(argv):
             emit({"result": True})
             return 0
         if mode == "segments":
-            wav_path = argv[1]
+            src = argv[1]
             models_dir = argv[2] if len(argv) > 2 and argv[2] else None
             duration = float(argv[3]) if len(argv) > 3 else 0.0
-            emit({"result": _segments(wav_path, models_dir, duration)})
+            cpu_threads = int(argv[4]) if len(argv) > 4 else 0
+            word_ts = (argv[5] != "0") if len(argv) > 5 else True
+            is_pcm = (argv[6] == "1") if len(argv) > 6 else False
+            if cpu_threads > 0:
+                # Chốt trần luồng OpenMP TRƯỚC khi thư viện native nạp.
+                os.environ.setdefault("OMP_NUM_THREADS", str(cpu_threads))
+            emit({"result": _segments(src, models_dir, duration, cpu_threads,
+                                      word_ts, is_pcm)})
             return 0
         emit({"error": f"Chế độ lạ: {mode}"})
         return 1

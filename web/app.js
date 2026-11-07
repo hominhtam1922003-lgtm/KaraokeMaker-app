@@ -318,6 +318,7 @@ function applyPreset(p, btn) {
     x.classList.toggle("active", x.dataset.color === p.color));
   document.querySelectorAll(".preset").forEach((x) => x.classList.remove("active"));
   if (btn) btn.classList.add("active");
+  saveStyle();
 }
 PRESETS.forEach((p, i) => {
   const b = document.createElement("button");
@@ -334,6 +335,7 @@ $("gradRow").addEventListener("click", (e) => {
   b.classList.add("active");
   state.gradKind = b.dataset.g;
   document.querySelector('input[name="bgtype"][value="gradient"]').checked = true;
+  saveStyle();
 });
 function collectStyle() {
   return {
@@ -354,8 +356,47 @@ $("colorSwatches").addEventListener("click", (e) => {
   document.querySelectorAll(".sw").forEach((x) => x.classList.remove("active"));
   b.classList.add("active");
   state.color = b.dataset.color;
+  saveStyle();
 });
-$("fontSize").addEventListener("input", (e) => ($("sizeVal").textContent = e.target.value));
+$("fontSize").addEventListener("input", (e) => {
+  $("sizeVal").textContent = e.target.value;
+  saveStyle();
+});
+/* Nhớ lựa chọn kiểu chữ/nền cho lần mở app sau (khỏi phải chọn lại). */
+function saveStyle() {
+  try {
+    localStorage.setItem("km_style_v1", JSON.stringify({
+      color: state.color, base: state.baseColor, outline: state.outlineW,
+      font: $("fontSel").value, size: $("fontSize").value,
+      effect: $("effectSel").value, fade: $("fadeChk").checked,
+      two: $("twoLineChk").checked, grad: state.gradKind,
+    }));
+  } catch (e) { /* bộ nhớ bị tắt/đầy thì bỏ qua, không chặn app */ }
+}
+function restoreStyle() {
+  let s = null;
+  try { s = JSON.parse(localStorage.getItem("km_style_v1") || "null"); } catch (e) { }
+  if (!s) return;
+  if (s.color) state.color = s.color;
+  if (s.base) state.baseColor = s.base;
+  if (s.outline) state.outlineW = s.outline;
+  if (s.font) $("fontSel").value = s.font;
+  if (s.size) { $("fontSize").value = s.size; $("sizeVal").textContent = s.size; }
+  if (s.effect) $("effectSel").value = s.effect;
+  $("fadeChk").checked = !!s.fade;
+  $("twoLineChk").checked = !!s.two;
+  document.querySelectorAll(".sw").forEach((x) =>
+    x.classList.toggle("active", x.dataset.color === state.color));
+  document.querySelectorAll(".preset").forEach((x) => x.classList.remove("active"));
+  if (s.grad) {
+    state.gradKind = s.grad;
+    document.querySelectorAll(".grad").forEach((x) =>
+      x.classList.toggle("active", x.dataset.g === s.grad));
+  }
+}
+["fontSel", "effectSel", "fadeChk", "twoLineChk"].forEach((id) =>
+  $(id).addEventListener("change", saveStyle));
+restoreStyle();
 async function uploadBg(file, kind) {
   const data = await postRaw("/api/upload-bg-" + kind, file,
     { "X-File-Name": encodeURIComponent(file.name) });

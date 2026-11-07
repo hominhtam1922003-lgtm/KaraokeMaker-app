@@ -110,9 +110,11 @@ _WHISPER_LOCK = threading.Lock()
 _WHISPER_READY = False
 
 
-def _ensure_whisper(models_dir):
+def _ensure_whisper(models_dir, progress_cb=None):
     """Nạp/tải model Whisper MỘT lần dưới khoá — nhiều bài chạy song song
-    không được tải trùng (tránh hỏng file model khi tải dở cùng lúc)."""
+    không được tải trùng (tránh hỏng file model khi tải dở cùng lúc).
+    Tiến độ tải được chuyển tiếp ra ngoài (bản cũ nuốt mất, người dùng
+    nhìn thanh phần trăm đứng im suốt mấy phút tải 470 MB)."""
     global _WHISPER_READY
     if _WHISPER_READY:
         return
@@ -120,7 +122,7 @@ def _ensure_whisper(models_dir):
         if _WHISPER_READY:
             return
         from karaoke import align as alg
-        alg.load_model_only(models_dir)
+        alg.load_model_only(models_dir, progress_cb)
         _WHISPER_READY = True
 
 
@@ -153,17 +155,46 @@ def run_pipeline(cb, ctx, texts, sep_mode, style, title, guide, bg,
     inst_out = os.path.join(work, "inst.wav")
     ass_path = os.path.join(work, "lyrics.ass")
     out_mp4 = os.path.join(work, "karaoke.mp4")
-    cb(1, "Đang tách beat...")
-    if sep_mode == "fast":
-        media.center_cut(song_wav, inst_out, _scaled(cb, 2, 30), duration)
-    else:
-        mdx.separate_mdx(song_wav, inst_out, progress_cb=_scaled(cb, 2, 30))
-    ctx.update(inst_wav=inst_out, inst_mode=sep_mode)
-    _ensure_whisper(models_dir)
     from karaoke import align as alg
-    segs = alg.transcribe_segments(song_wav, duration, _scaled(cb, 32, 68),
+    cb(1, "Đang chuẩn bị...")
+    _ensure_whisper(models_dir, _scaled(cb, 2, 8))
+    # Tách beat và nghe lời là hai việc ĐỘC LẬP — chạy SONG SONG thay vì nối
+    # đuôi nhau (giảm gần nửa tổng thời gian chờ). Tiến độ hai luồng được
+    # trộn theo trọng số để thanh % chạy một mạch, không nhảy lùi.
+    frac = {"sep": 0.0, "wh": 0.0}
+    frac_lock = threading.Lock()
+
+    def combined_cb(which):
+        def _cb(p, label=""):
+            with frac_lock:
+                frac[which] = max(frac[which],
+                                  min(100.0, max(0.0, float(p))) / 100.0)
+                total = 8 + 66 * (0.45 * frac["sep"] + 0.55 * frac["wh"])
+            cb(total, label)
+        return _cb
+
+    sep_err = {}
+
+    def do_sep():
+        try:
+            if sep_mode == "fast":
+                media.center_cut(song_wav, inst_out, combined_cb("sep"),
+                                 duration)
+            else:
+                mdx.separate_mdx(song_wav, inst_out,
+                                 progress_cb=combined_cb("sep"))
+        except Exception as e:  # noqa: BLE001
+            sep_err["e"] = e
+
+    sep_thread = threading.Thread(target=do_sep, daemon=True)
+    sep_thread.start()
+    segs = alg.transcribe_segments(song_wav, duration, combined_cb("wh"),
                                    models_dir)
-    cb(70, "Đang gắn mốc giờ từng câu...")
+    sep_thread.join()
+    if "e" in sep_err:
+        raise sep_err["e"]
+    ctx.update(inst_wav=inst_out, inst_mode=sep_mode)
+    cb(76, "Đang gắn mốc giờ từng câu...")
     if texts:
         heard = [w for s in segs for w in s["words"]]
         full = alg.align_full(heard, texts, duration)

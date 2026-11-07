@@ -122,6 +122,16 @@ def extract_audio(src, dst_wav):
     _run(cmd, label="trích âm thanh")
 
 
+def decode_pcm16k(src_wav, dst_path):
+    """Giải mã sẵn về PCM float32 16kHz mono (định dạng Whisper ăn trực
+    tiếp) bằng ffmpeg của app — để worker Whisper nạp mảng số mà KHÔNG phải
+    qua PyAV giải mã nữa (bớt một mắt xích native từng gây treo/lỗi khó
+    lường trên máy Windows)."""
+    cmd = [ffmpeg_bin(), "-y", "-v", "error", "-i", src_wav,
+           "-vn", "-ac", "1", "-ar", "16000", "-f", "f32le", dst_path]
+    _run(cmd, label="giải mã PCM cho AI nghe lời")
+
+
 def center_cut(in_wav, out_wav, progress_cb=None, duration=None):
     """Tách beat NHANH: lấy hiệu hai kênh (L-R) để triệt giọng hát ở giữa.
     Nhanh nhưng beat có thể mỏng và còn vọng giọng với bài mix hiện đại."""
